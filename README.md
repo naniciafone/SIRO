@@ -30,3 +30,18 @@ Directories should be organized as follows, with folders organized by data:
 
    ```
 
+### Assign Directory Path and Call Data
+```bash
+dir = "your directory here"
+
+```bash
+lidar = glob.glob(os.path.join(dir, "lidar","*.tif"))
+modeled = os.path.join(dir, "modeled")
+
+rasters = (
+    glob.glob(os.path.join(modeled, "*EB_snow_depth*.tif")) +
+    glob.glob(os.path.join(modeled, "*TI_snow_depth*.tif")) +
+    glob.glob(os.path.join(modeled, "*thickness*.tif")) +
+    glob.glob(os.path.join(modeled, "*snod*.tif"))
+)
+```
