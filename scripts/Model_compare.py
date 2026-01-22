@@ -20,7 +20,7 @@ from datetime import datetime
 
 
 # set directory
-dir = "C:/Users/RDCRLSMC/Desktop/SIRO/Task1/dates/2024/20240315"
+dir = "C:/Users/RDCRLSMC/Desktop/SIRO/Task1/dates/2025/20250501"
 
 
 # In[11]:
@@ -33,9 +33,9 @@ parts = os.path.basename(lidar[0]).split("_")
 for part in parts:
     if part.isdigit() and len(part) == 8:
         date_str = part
-        #break
+        break
 
-        date_obj = datetime.strptime(date_str, "%Y%m%d")
+date_obj = datetime.strptime(date_str, "%Y%m%d")
 
 with rasterio.open(lidar[0]) as src:
     data = src.read(1, masked=True)
@@ -159,18 +159,6 @@ stats_df = pd.DataFrame(stats_list)
 stats_csv = os.path.join(out_dir, "basin_stats.csv")
 stats_df.to_csv(stats_csv, index=False)
 
-
-# In[17]:
-
-
-hms_ti_file = rasters["HMS_TI"][0]
-
-# Step 2: Read raster into array
-with rasterio.open(hms_ti_file) as src:
-    arr = src.read(1)          # read first band
-    nodata = src.nodata        # get NoData value
-
-print(nodata)
 
 
 # In[18]:
