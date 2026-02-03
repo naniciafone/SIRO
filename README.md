@@ -6,10 +6,26 @@ Descriptions of where to find what will be added soon
 
 
 ## Table of Contents
-- [LiDAR Prepration]()
+- [Data Prep]()
 - [Model Comparison]()
 
-## LiDAR Prep
+## Data Prep
+
+### LiDAR
+
+Raw LiDAR geotiffs were resampled from 0.5-m to 100-m using bilinear, cubic, and average resampling. No significant difference
+between the average and spread of resampled outputs was found. However, average resampling may populate a pixel with sparse
+data and therefore misrepresent the dataset. As areas of sparse data often correlate with noise, it is better to classify
+sparse pixels as NA. As bilinear and cubic resampling both retain NA values when downsampling, these methods were chosen over average 
+resampling. 
+
+LiDAR data was filtered and then iteratively downsampled using cubic resampling with ```GDAL.warp   ```. All values 
+less than *-0.2 meters* and greater than *10 meters* were set to NAN. The lower threshold was selected after investigating 
+along Highway 21, the corridor used for co-registration. All LiDAR rasters were clipped to the co-registration region 
+using the same clipping geometry as is used in ice-road-copters, and the average, min, max, and SD of clipped rasters were 
+extracted to understand the variability in offsets along the "no change"  region. For all clipped rasters, the mean minus 
+one SD was greater than *-0.2 meters*. Once rasters were filtered by value,  rasters were then iteratively resampled from 
+0.5-meter -> 1-meter -> 10-meter -> 100-meter. Remaining negative pixels were set to 0. 
 
 ## Model Comparison
 
@@ -21,12 +37,14 @@ Directories should be organized as follows, with folders organized by data:
    └── lidar/
        ├── "lidar file"/
    └── modeled/
-       ├── HMS Energy Balance
-       └── HMS
-       └── SnowModel
-       └── iSnobal
-   └── outputs/
+       ├── HMS Energy Balance geotiff
+       └── HMS Temperature Index geotiff
+       └── SnowModel geotiff
+       └── iSnobal geotiff
+   └── outputs
    └── MCS_outline
+          └── MCS_outline.shp
+          └── basin_outline.ship
 
    ```
 
