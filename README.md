@@ -6,8 +6,8 @@ Descriptions of where to find what will be added soon
 
 
 ## Table of Contents
-- [Data Prep]()
-- [Model Comparison]()
+- Data Prep
+- Model Comparison
 
 ## Data Prep
 
@@ -19,7 +19,7 @@ data and therefore misrepresent the dataset. As areas of sparse data often corre
 sparse pixels as NA. As bilinear and cubic resampling both retain NA values when downsampling, these methods were chosen over average 
 resampling. 
 
-LiDAR data was filtered and then iteratively downsampled using cubic resampling with ```GDAL.warp   ```. All values 
+LiDAR data was filtered and then iteratively downsampled using cubic resampling with ```GDAL.warp```. All values 
 less than *-0.2 meters* and greater than *10 meters* were set to NAN. The lower threshold was selected after investigating 
 along Highway 21, the corridor used for co-registration. All LiDAR rasters were clipped to the co-registration region 
 using the same clipping geometry as is used in ice-road-copters, and the average, min, max, and SD of clipped rasters were 
@@ -27,79 +27,275 @@ extracted to understand the variability in offsets along the "no change"  region
 one SD was greater than *-0.2 meters*. Once rasters were filtered by value,  rasters were then iteratively resampled from 
 0.5-meter -> 1-meter -> 10-meter -> 100-meter. Remaining negative pixels were set to 0. 
 
+### HMS Resampling
+
+Per a conversation with the HMS team, HMS was run at 2000-m and 100-m resolution with no appreciable difference in computed results.
+Both TI and ET implementations of HMS are "heavily dependent on the resolution of the met data used as boundary condition". HRRR 
+data was already interpolated from 3-km to 2-km, adding "an artificial increase in precision but not accuracy". The HMS team therefore
+elected to run the model at 2,000-m resolution rather than 100-m, and I have resampled the data for model comparison.
+The resampling method can be found in [scripts/resample.py](scripts/resample.py).
+
+
 ## Model Comparison
+
+The script used to difference modeled outputs and LiDAR data can be found at [scripts/Model_compare.py](scripts/Model_compare.py). The following subsections describe a breakdown of this script.
 
 ### Directory Structure
 
-Directories should be organized as follows, with folders organized by data:
+Directories should be organized as follows, with folders organized by date. ```MCS_outline.shp``` is the LiDAR domain and ```basin_outline.shp``` is teh Mores Creek Summit Basin.
    ```
    Date/
    └── lidar/
        ├── "lidar file"/
    └── modeled/
-       ├── HMS Energy Balance geotiff
-       └── HMS Temperature Index geotiff
-       └── SnowModel geotiff
-       └── iSnobal geotiff
+       ├── "HMS Energy Balance geotiff"
+       └── "HMS Temperature Index geotiff"
+       └── "SnowModel geotiff"
+       └── "iSnobal geotiff"
    └── outputs
    └── MCS_outline
-          └── MCS_outline.shp
-          └── basin_outline.ship
+       └── MCS_outline.shp
+       └── basin_outline.shp
 
    ```
+### Script Breakdown
 
-### Assign Directory Path and call modeled and LiDAR data
 
-```bash
-dir = "your directory here"
+All LiDAR NANs are set to ```-9999```, and the date is extracted from the LiDAR file path.
+
+<details>
+  <summary>LiDAR Prep </summary>
+
+Set up directory structure and extract date:
+
+```
+dir = "C:/Users/RDCRLSMC/Desktop/SIRO/Task1/dates/2025/20250501"
 lidar = glob.glob(os.path.join(dir, "lidar","*.tif"))
-modeled = os.path.join(dir, "modeled")
 
-rasters = (
-    glob.glob(os.path.join(modeled, "*EB_snow_depth*.tif")) +
-    glob.glob(os.path.join(modeled, "*TI_snow_depth*.tif")) +
-    glob.glob(os.path.join(modeled, "*thickness*.tif")) +
-    glob.glob(os.path.join(modeled, "*snod*.tif"))
-)
+parts = os.path.basename(lidar[0]).split("_")
+for part in parts:
+    if part.isdigit() and len(part) == 8:
+        date_str = part
+        break
 
-rasters = (
-    glob.glob(os.path.join(modeled, "*EB_snow_depth*.tif")) +
-    glob.glob(os.path.join(modeled, "*TI_snow_depth*.tif")) +
-    glob.glob(os.path.join(modeled, "*thickness*.tif")) +
-    glob.glob(os.path.join(modeled, "*snod*.tif"))
-)
+date_obj = datetime.strptime(date_str, "%Y%m%d")
+
+with rasterio.open(lidar[0]) as src:
+    data = src.read(1, masked=True)
+    profile = src.profile
+    profile.update(dtype=rasterio.float32, nodata=-9999)
+    outfile = os.path.join(dir, "lidar", "lidar_"+date_str+".tif")
+ ```
+Replace NANs with  ```-9999 ```
+
+ ```
+data_filled = np.where(np.isnan(data), -9999, data)
+with rasterio.open(outfile, "w", **profile) as dst:
+    dst.write(data_filled.astype("float32"), 1)  
+lidar_raster = outfile
+ ```
+
+</details>
+
+
+
+HMS outputs must be converted from inches to centimeters, and again, all NANs are set to ```-9999 ```. These geotiffs are 
+writted to the ```modeled/``` directory. 
+
+<details>
+  <summary> HMS Prep </summary>
+
+```
+HMS_EB = glob.glob(os.path.join(modeled, "*EB_snow_depth*.tif"))[0]
+HMS_TI = glob.glob(os.path.join(modeled, "*TI_snow_depth*.tif"))[0]
+
+with rasterio.open(HMS_EB) as src:
+    raster_data = src.read(1, masked=True).filled(np.nan)
+    out_raster = raster_data * 0.0254
+    
+    # Replace NaN with NoData value
+    nodata_val = -9999
+    out_raster = np.where(np.isnan(out_raster), nodata_val, out_raster)
+    
+    out_path = os.path.join(modeled, "HMS_EB_inches.tif")
+    profile = src.profile
+    profile.update(dtype=rasterio.float32, nodata=nodata_val)
+    
+    with rasterio.open(out_path, "w", **profile) as dest:
+        dest.write(out_raster.astype("float32"), 1)
+
+with rasterio.open(HMS_TI) as src:
+    raster_data = src.read(1, masked=True).filled(np.nan)
+    out_raster = raster_data * 0.0254
+    
+    # Replace NaN with NoData value
+    nodata_val = -9999
+    out_raster = np.where(np.isnan(out_raster), nodata_val, out_raster)
+    
+    out_path = os.path.join(modeled, "HMS_TI_inches.tif")
+    profile = src.profile
+    profile.update(dtype=rasterio.float32, nodata=nodata_val)
+    
+    with rasterio.open(out_path, "w", **profile) as dest:
+        dest.write(out_raster.astype("float32"), 1)
 ```
 
-### Look at Basin Wide Data
+</details>
 
-Call Mores Creek Summit Shapefile
+Rasters for all models are called from the ```modeled/``` folder using ```glob``` to query the unique filename. The
+Mores Creek Summit Basin shapefile is called from ```MCS_outline/```. Modeled inputs are clipped to the basin shapefile 
+using the ```fiona``` package, and clipped outputs are stored in ```outputs/```. For each clipped raster,
+the raster minimum, maximum, mean, and total number of 0 pixels (snow free pixels) are written to a dataframe that is stored
+as a csv in ```outputs/```. 
 
-```bash
+
+
+<details>
+  <summary> Basin-Wide Analysis </summary>
+
+```
 MCS = os.path.join(dir, "MCS_outline/basin_outline.shp")
-```
 
-And mask modeled inputs by MCS shapefile. Masked inputs are saved to "outputs" directory:
-
-```bash
 with fiona.open(MCS, "r") as shapefile:
     shapes = [feature["geometry"] for feature in shapefile]
 
-for raster in rasters:
-    with rasterio.open(raster) as src:
-        out_image, out_transform = rasterio.mask.mask(src, shapes, crop=True)
-        out_meta = src.meta
-    
-    out_meta.update({"driver": "GTiff",
-                 "height": out_image.shape[1],
-                 "width": out_image.shape[2],
-                 "transform": out_transform})
-    
-    out_dir = os.path.join(dir, "outputs")
-    os.makedirs(out_dir, exist_ok=True)
 
-    out_name = os.path.basename(raster).replace(".tif", "_MCS.tif")
-    out_path = os.path.join(out_dir, out_name)
+out_dir = os.path.join(dir, "outputs")
+stats_list = []
 
-    with rasterio.open(out_path, "w", **out_meta) as dest:
-        dest.write(out_image)
+#Loop by model
+
+for model, raster_list in rasters.items():
+    for raster in raster_list:
+        with rasterio.open(raster) as src:
+            out_image, out_transform = rasterio.mask.mask(src, shapes, crop=True)
+            profile = src.profile
+
+        # Include model in output filename
+        out_name = f"{model}_basin_clip.tif"
+        out_path = os.path.join(out_dir, out_name)
+
+        with rasterio.open(out_path, "w", **profile) as dest:
+            dest.write(out_image)
+
+# Compute statistics
+        data = out_image  # 1 band raster, extract 2D array
+        mask = (data == -9999)
+        data_masked = np.ma.array(data, mask=mask)  # mask nodata
+
+        raster_stats = {
+            "file": out_name,
+            "model": model,
+            "min": data_masked.min(),
+            "mean": data_masked.mean(),
+            "max": data_masked.max(),
+            "zeros": np.sum(data_masked == 0)
+        }
+        
+        stats_list.append(raster_stats)
+
+
+# Convert stats to a DataFrame
+stats_df = pd.DataFrame(stats_list)
+stats_csv = os.path.join(out_dir, "basin_stats.csv")
+stats_df.to_csv(stats_csv, index=False)
+
 ```
+</details>
+
+A figure of basin-wide rasters and a boxplot of basin-wide values are generated and stored in ```outputs/``` (not included in code block below).
+Modeled outputs and LiDAR data are all clipped to the LiDAR domain. Clipped rasters are stored in ```outputs/```. Similarly, a figure 
+of clipped rasters and a boxplot of clipped raster values is stored in the same directory, but this code is not included below. 
+
+<details>
+  <summary> LiDAR-Domain Analysis </summary>
+
+```
+MCS = os.path.join(dir, "MCS_outline/MCS_outline.shp")
+
+with fiona.open(MCS, "r") as shapefile:
+    shapes = [feature["geometry"] for feature in shapefile]
+
+rasters = {
+    "HMS_EB": glob.glob(os.path.join(modeled, "*EB_inches*.tif")),
+    "HMS_TI": glob.glob(os.path.join(modeled, "*TI_inches*.tif")),
+    "iSnobal": glob.glob(os.path.join(modeled, "*thickness*.tif")),
+    "SnowModel": glob.glob(os.path.join(modeled, "*snod*.tif")),
+    "LiDAR": [lidar_raster]
+}
+
+for model, raster_list in rasters.items():
+    for raster in raster_list:
+        with rasterio.open(raster) as src:
+            out_image, out_transform = rasterio.mask.mask(src, shapes, crop=True)
+            out_meta = src.meta.copy()
+
+        out_meta.update({
+            "driver": "GTiff",
+            "height": out_image.shape[1],
+            "width": out_image.shape[2],
+            "transform": out_transform,
+        })
+
+        # Include model in output filename
+        out_name = f"{model}_MCS_clip.tif"
+        out_path = os.path.join(out_dir, out_name)
+
+        with rasterio.open(out_path, "w", **out_meta) as dest:
+            dest.write(out_image)
+
+```
+
+</details>
+
+Resample all model rasters to match LiDAR grid, and subtract model outputs from LiDAR data.
+
+<details>
+  <summary> LiDAR-Domain Analysis </summary>
+
+```
+for model, raster_path in rasters.items():
+    with rasterio.open(raster_path) as src:
+        model_data = src.read(1, masked=True)
+        model_transform = src.transform
+        model_crs = src.crs
+
+        # Assign CRS if missing
+        if model_crs is None:
+            model_crs = lidar_crs
+            print(f"Assigned CRS {model_crs} to {model} because it was missing.")
+
+        # Prepare array for reprojected data
+        reprojected_model = np.empty(lidar_data.shape, dtype=np.float32)
+
+        # Reproject/resample model to match LiDAR
+        reproject(
+            source=model_data,
+            destination=reprojected_model,
+            src_transform=model_transform,
+            src_crs=model_crs,
+            dst_transform=lidar_transform,
+            dst_crs=lidar_crs,
+            resampling=Resampling.bilinear
+        )
+
+        # Mask wherever either raster is NaN / masked
+        combined_mask = (lidar_data.data == -9999) | (reprojected_model == -9999)
+        model_masked = np.ma.array(reprojected_model, mask=combined_mask)
+        lidar_masked = np.ma.array(lidar_data, mask=combined_mask)
+
+        # Compute difference
+        diff_data = lidar_masked - model_masked
+
+        # Write difference raster
+        out_profile = profile.copy()
+        out_profile.update(dtype=rasterio.float32, compress="lzw")
+
+        # Write difference raster
+        out_path = os.path.join(outputs, f"{model.replace(' ', '_')}_lidar_diff.tif")
+        with rasterio.open(out_path, "w", **out_profile) as dst:
+            dst.write(diff_data.filled(np.nan).astype(np.float32), 1)
+
+```
+
+</details>
