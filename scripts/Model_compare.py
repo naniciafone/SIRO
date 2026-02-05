@@ -20,7 +20,7 @@ from datetime import datetime
 
 
 # set directory
-dir = "C:/Users/RDCRLSMC/Desktop/SIRO/Task1/dates/2025/20250501"
+dir = "C:/Users/RDCRLSMC/Desktop/SIRO/Task1/dates/2023/20230405"
 
 
 # In[11]:
@@ -459,9 +459,6 @@ lidar = os.path.join(outputs, "LiDAR_MCS_clip.tif")
 
 
 # In[392]:
-
-
-rasters = {"SnowModel": os.path.join(outputs, "SnowModel_MCS_clip.tif")}
 
 
 # In[404]:
