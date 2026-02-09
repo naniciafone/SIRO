@@ -36,9 +36,10 @@ elected to run the model at 2,000-m resolution rather than 100-m, and I have res
 The resampling method can be found in [scripts/resample.py](scripts/resample.py).
 
 
-## Model Comparison
+## Model Preparation
 
-The script used to difference modeled outputs and LiDAR data can be found at [scripts/Model_compare.py](scripts/Model_compare.py). The following subsections describe a breakdown of this script.
+The script used to difference modeled outputs and LiDAR data can be found at [scripts/Model_prep.py](scripts/Model_prep.py). The following subsections describe a breakdown of this script.
+
 
 ### Directory Structure
 
@@ -46,20 +47,44 @@ Directories should be organized as follows, with folders organized by date. ```M
    ```
    Date/
    └── lidar/
-       ├── "lidar file"/
+       ├── "lidar file"
    └── modeled/
-       ├── "HMS Energy Balance geotiff"
-       └── "HMS Temperature Index geotiff"
-       └── "SnowModel geotiff"
-       └── "iSnobal geotiff"
-   └── outputs
-   └── MCS_outline
+       └── Task1/
+           └── "HMS Energy Balance geotiff"
+           └── "HMS Temperature Index geotiff"
+           └── "SnowModel geotiff"
+           └── "iSnobal geotiff"
+       └── Task2/
+           └── "HMS Energy Balance geotiff"
+           └── "HMS Temperature Index geotiff"
+           └── "SnowModel geotiff"
+           └── "iSnobal geotiff"
+       └── SNODAS
+            └── basin_clip
+            └── MCS_clip
+   └── outputs/
+       └── task1/
+            └── rasters/
+            └── figs/
+       └── task2/
+            └── rasters/
+            └── figs/
+   └── MCS_outline/
        └── MCS_outline.shp
        └── basin_outline.shp
+   └── Model_prep.py
 
    ```
 ### Script Breakdown
+[Model_prep.py](scripts/Model_prep.py) is set to run in the folder in which it is located. ```Task_numer``` must be set to 1 or 2.  
 
+<details>
+  <summary>Directory set up</summary>
+
+dir = "."
+
+Task_number = 1
+</details>
 
 All LiDAR NANs are set to ```-9999```, and the date is extracted from the LiDAR file path.
 
@@ -69,7 +94,7 @@ All LiDAR NANs are set to ```-9999```, and the date is extracted from the LiDAR 
 Set up directory structure and extract date:
 
 ```
-dir = "C:/Users/RDCRLSMC/Desktop/SIRO/Task1/dates/2025/20250501"
+dir = "."
 lidar = glob.glob(os.path.join(dir, "lidar","*.tif"))
 
 parts = os.path.basename(lidar[0]).split("_")
@@ -80,11 +105,16 @@ for part in parts:
 
 date_obj = datetime.strptime(date_str, "%Y%m%d")
 
-with rasterio.open(lidar[0]) as src:
-    data = src.read(1, masked=True)
-    profile = src.profile
-    profile.update(dtype=rasterio.float32, nodata=-9999)
-    outfile = os.path.join(dir, "lidar", "lidar_"+date_str+".tif")
+f os.path.exists(outfile):
+    print(f"Skipping existing LiDAR raster: {outfile}")
+    lidar_raster = outfile
+else:
+    with rasterio.open(lidar[0]) as src:
+        data = src.read(1, masked=True)
+        profile = src.profile
+        profile.update(dtype=rasterio.float32, nodata=-9999)
+        outfile = os.path.join(dir, "lidar", "lidar_"+date_str+".tif")
+
  ```
 Replace NANs with  ```-9999 ```
 
@@ -100,12 +130,17 @@ lidar_raster = outfile
 
 
 HMS outputs must be converted from inches to centimeters, and again, all NANs are set to ```-9999 ```. These geotiffs are 
-writted to the ```modeled/``` directory. 
+written to the ```modeled/``` directory. 
 
 <details>
   <summary> HMS Prep </summary>
 
 ```
+if Task_number == 1:
+    modeled = os.path.join(dir, "modeled/Task1")
+else:
+    modeled = os.path.join(dir, "modeled/Task2")
+
 HMS_EB = glob.glob(os.path.join(modeled, "*EB_snow_depth*.tif"))[0]
 HMS_TI = glob.glob(os.path.join(modeled, "*TI_snow_depth*.tif"))[0]
 
@@ -154,11 +189,26 @@ as a csv in ```outputs/```.
   <summary> Basin-Wide Analysis </summary>
 
 ```
-MCS = os.path.join(dir, "MCS_outline/basin_outline.shp")
+rasters = {
+    "HMS_EB": glob.glob(os.path.join(modeled, "*EB_inches*.tif")),
+    "HMS_TI": glob.glob(os.path.join(modeled, "*TI_inches*.tif")),
+    "iSnobal": glob.glob(os.path.join(modeled, "*thickness*.tif")),
+    "SnowModel": glob.glob(os.path.join(modeled, "*snod*.tif")),
+}
 
+# Call shapefile
+MCS = os.path.join(dir, "MCS_outline/basin_outline.shp")
 with fiona.open(MCS, "r") as shapefile:
     shapes = [feature["geometry"] for feature in shapefile]
 
+# Set up directory structure
+if Task_number == 1:
+    out_dir = os.path.join(dir, "outputs/task1/")
+else:
+    out_dir = os.path.join(dir, "outputs/task2/")
+
+rasters_dir = os.path.join(out_dir, "rasters/")
+figs_dir = os.path.join(out_dir, "figs/")
 
 out_dir = os.path.join(dir, "outputs")
 stats_list = []
@@ -239,7 +289,7 @@ for model, raster_list in rasters.items():
 
         # Include model in output filename
         out_name = f"{model}_MCS_clip.tif"
-        out_path = os.path.join(out_dir, out_name)
+        out_path = os.path.join(rasters_dir, out_name)
 
         with rasterio.open(out_path, "w", **out_meta) as dest:
             dest.write(out_image)
@@ -254,6 +304,16 @@ Resample all model rasters to match LiDAR grid, and subtract model outputs from 
   <summary> LiDAR-Domain Analysis </summary>
 
 ```
+del rasters["LiDAR"]
+lidar = os.path.join(rasters_dir, "LiDAR_MCS_clip.tif")
+
+
+with rasterio.open(lidar) as src:
+    lidar_data = src.read(1, masked=True)
+    profile = src.profile                 # for writing outputs
+    lidar_crs = src.crs
+    lidar_transform = src.transform 
+
 for model, raster_path in rasters.items():
     with rasterio.open(raster_path) as src:
         model_data = src.read(1, masked=True)
@@ -292,7 +352,7 @@ for model, raster_path in rasters.items():
         out_profile.update(dtype=rasterio.float32, compress="lzw")
 
         # Write difference raster
-        out_path = os.path.join(outputs, f"{model.replace(' ', '_')}_lidar_diff.tif")
+        out_path = os.path.join(rasters_dir, f"{model.replace(' ', '_')}_lidar_diff.tif")
         with rasterio.open(out_path, "w", **out_profile) as dst:
             dst.write(diff_data.filled(np.nan).astype(np.float32), 1)
 
