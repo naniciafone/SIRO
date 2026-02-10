@@ -6,10 +6,13 @@ Descriptions of where to find what will be added soon
 
 
 ## Table of Contents
-- Data Prep
-- Model Comparison
+- Data Preparation
+  - LiDAR
+  - HMS
+  - SNODAS
+- Preparation for Model Comparison 
 
-## Data Prep
+## Data Preparation
 
 ### LiDAR
 
@@ -36,7 +39,7 @@ elected to run the model at 2,000-m resolution rather than 100-m, and I have res
 The resampling method can be found in [scripts/resample.py](scripts/resample.py).
 
 
-## Model Preparation
+## Preparation for Model Comparison
 
 The script used to difference modeled outputs and LiDAR data can be found at [scripts/Model_prep.py](scripts/Model_prep.py). The following subsections describe a breakdown of this script.
 
