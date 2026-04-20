@@ -114,3 +114,31 @@ def process_all_dates(parent_dir, task_number):
 
     return modeled_data
 
+
+def get_raw_data(parent_dir, task_number):
+    date_dirs = find_date_directories(parent_dir)
+    raw_data = {}
+    for dir in date_dirs:
+        date_str = os.path.basename(dir)
+        raw_data[date_str] = {}
+
+        if task_number == 1:
+            dir_rasters = os.path.join(dir, "modeled/Task1")
+        else:
+            dir_rasters = os.path.join(dir, "modeled/Task2")
+
+        raster = glob.glob(os.path.join(dir_rasters, "*HMS_TI*.tif"))
+        if raster:
+            raw_data[date_str]['HMS_TI'] = raster[0]
+        raster = glob.glob(os.path.join(dir_rasters, "*HMS_EB*.tif"))
+        if raster:
+            raw_data[date_str]['HMS_EB'] = raster[0]
+        raster = glob.glob(os.path.join(dir_rasters, "*snod*.tif"))
+        if raster:
+            raw_data[date_str]['Snow Model'] = raster[0]
+
+        raster = glob.glob(os.path.join(dir_rasters, "*thickness*.tif"))
+        if raster:
+            raw_data[date_str]['iSnobal'] = raster[0]
+
+    return raw_data
