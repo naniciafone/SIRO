@@ -1,0 +1,12 @@
+name: siro_sca_env
+channels:
+ - conda-forge
+dependencies:
+ - python=3.14.4
+ - dask
+ - gdal
+ - geopandas
+ - jupyterlab
+ - rioxarray
+ - netcdf4
+ - tqdm
