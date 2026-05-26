@@ -1,7 +1,17 @@
 import os
+os.environ['PROJ_DATA'] = "C:/Users/RDCRLSMC/AppData/Local/miniconda3/envs/SIRO/Library/share/proj"
 import re
 import glob
+from osgeo import gdal
+from pyproj import Proj, Transformer
 
+
+def x_y_snotel(snotel_station):
+    """
+    Convert Snotel from lon/lat to x/y
+    """
+    converter = Transformer.from_proj(Proj('EPSG:4326'), Proj('EPSG:32611'), always_xy=True)
+    return converter.transform(snotel_station.metadata.x, snotel_station.metadata.y)
 
 def find_date_directories(start_dir):
     """
@@ -142,3 +152,23 @@ def get_raw_data(parent_dir, task_number):
             raw_data[date_str]['iSnobal'] = raster[0]
 
     return raw_data
+
+
+def get_raster_pixel_value(file, geo_x, geo_y):
+    """
+    Return value from raster at given geo coordinates
+    """
+    dataset = gdal.Open(file)
+    gt = dataset.GetGeoTransform()
+
+    pixel_coords = gdal.ApplyGeoTransform(
+        gdal.InvGeoTransform(gt), geo_x, geo_y
+    )
+    pixel_x, pixel_y = int(pixel_coords[0]), int(pixel_coords[1])
+
+    band = dataset.GetRasterBand(1)
+    val_array = band.ReadAsArray(
+        xoff=pixel_x, yoff=pixel_y, win_xsize=1, win_ysize=1
+    )
+
+    return val_array[0][0]
