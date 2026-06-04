@@ -10,3 +10,5 @@ dependencies:
  - rioxarray
  - netcdf4
  - tqdm
+ - pip:
+  - p_tqdm
