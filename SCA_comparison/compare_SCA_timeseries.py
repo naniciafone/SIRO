@@ -15,14 +15,16 @@ from glob import glob
 from tqdm import tqdm
 from rasterio.enums import Resampling
 import xrspatial
+import matplotlib.pyplot as plt
 
 
 # ----- CONFIGURATION -----
 base_dir = "/Users/rdcrlrka/Research/SIRO/MCS_SCA/"
-model_sca_dir = os.path.join(base_dir, "model_SCA_maps")
+model_sca_dir = os.path.join(base_dir, "model_SCA")
 model_names = ["HMS-EB", "HMS-TI", "iSnobal", "SnowModel"]
-pss_sca_files = sorted(glob(os.path.join(base_dir, "PSS_SCA_maps", "*.tif")))
+pss_sca_files = sorted(glob(os.path.join(base_dir, "PSS_SCA", "*.tif")))
 dem_file = os.path.join(base_dir, "..", "DEMs", "USGS_2026_DEM_merged.tif")
+fsca_threshold = 0.1
 CRS = "EPSG:32611"
 out_dir = os.path.join(base_dir, "SCA_comparison_results")
 os.makedirs(out_dir, exist_ok=True)
@@ -43,11 +45,10 @@ def load_and_reproject_pss_sca(
     out_file: str = None,
     chunks: dict = None,
     resampling: str = "average",
-    threshold: float = 0.5,
+    threshold: float = 0.1,
     ) -> xr.DataArray:
 
     model_name = os.path.basename(model_file).split("_")[0]
-    print(f"Reprojecting PlanetScope SCA to {model_name} grid")
 
     if not pss_files:
         raise FileNotFoundError("pss_files list is empty.")
@@ -213,7 +214,7 @@ def compute_recall_by_terrain(pss_sca_da, model_sca_da, elev_da, aspect_da, elev
 # ----- MAIN WORKFLOW -----
 def main():
     # --- Calculate PlanetScope areas time series at native grid ---
-    sca_pss_native_file = os.path.join(out_dir, "SCA_totals_timeseries_PlanetScope_native_grid.csv")
+    sca_pss_native_file = os.path.join(out_dir, "SCA_totals_timeseries_PSS_native_grid.csv")
     if os.path.exists(sca_pss_native_file):
         print(f"PlanetScope areas time series at native grid already exists, loading from file: {sca_pss_native_file}")
         sca_pss_native_df = pd.read_csv(sca_pss_native_file)
@@ -226,9 +227,9 @@ def main():
                 sca, masked, valid = sca_and_masked_area(pss_sca_da)
             df = pd.DataFrame({
                 'datetime': [os.path.basename(pss_sca_file).split('_')[0]],
-                'SCA_PlanetScope_m2': [sca],
-                'masked_area_PlanetScope_m2': [masked],
-                'valid_area_PlanetScope_m2': [valid]
+                'SCA_PSS-native-grid_m2': [sca],
+                'masked_area_PSS-native-grid_m2': [masked],
+                'valid_area_PSS-native-grid_m2': [valid]
             }, index=[0])
             sca_pss_native_list += [df]
         sca_pss_native_df = pd.concat(sca_pss_native_list, ignore_index=True)
@@ -241,144 +242,224 @@ def main():
         elev_bins = get_elev_bins(dem_da, bin_width=50)
         aspect_bins = np.arange(0, 361, 45)
 
-    # --- Iterate over models ---
-    for model in model_names:
-        print(f"\nProcessing model: {model}")
+    # --- Iterate over Tasks ---
+    for task in [1,2]:
+        print(f"\nTask {task}")
 
-        # Get input files
-        model_files = sorted(glob(os.path.join(model_sca_dir, f"{model}*.nc")))
-        if not model_files:
-            print(f"  No files found for {model}")
-            continue
-        # NOTE: Found no difference in SCA when varying SWE threshold,
-        # so just processing the first file for each model
-        mf = model_files[0]
-        model_name = "HMS" if "HMS" in model else model
+        # --- Iterate over models ---
+        for model in model_names:
+            print(f"\nProcessing model: {model}")
 
-        # --- Define output files for this model---
-        pss_regrid_file = os.path.join(out_dir, f"PlanetScope_SCA_{model_name}_grid.nc")
-        sca_file = os.path.join(out_dir, f"SCA_totals_timeseries_{model}.csv")
-        cm_file = os.path.join(out_dir, f"confusion_matrices_{model}.csv")
-        recall_terrain_file = os.path.join(out_dir, f"recall_binned_elev_aspect_{model}.nc")
-
-        # --- Regrid PlanetScope to model grid ---
-        if not os.path.exists(pss_regrid_file):
-            print(f"Regridding PlanetScope SCA time series to {model_name} grid")
-            pss_regrid = load_and_reproject_pss_sca(pss_sca_files, mf, pss_regrid_file)
-        else:
-            print("Regridded PlanetScope SCA time series already exists, skipping.")
-
-        # --- SCA totals ---
-        if os.path.exists(sca_file):
-            print(f"SCA totals CSV exists, skipping: {sca_file}")
-        else:
-            with (
-                xr.open_dataset(mf).SCA.squeeze() as model_sca,
-                xr.open_dataset(pss_regrid_file).SCA.squeeze() as pss_regrid
-                ):
-                # Set no data values to NaN
-                model_sca = xr.where(model_sca == 255, np.nan, model_sca)
-                pss_regrid = xr.where(pss_regrid == 255, np.nan, pss_regrid)
-
-                # Model areas time series
-                model_sca = model_sca.rio.write_crs(CRS)
-                model_sca = model_sca.sel(time=pss_regrid["time"], method="nearest")
-                model_snow, model_masked, model_valid = sca_and_masked_area(model_sca)
-
-                # PlanetScope regridded areas time series
-                pss_regrid_snow, pss_regrid_masked, pss_regrid_valid = sca_and_masked_area(pss_regrid)
-
-                # Compile in DataFrame
-                sca_df = pd.DataFrame({
-                    "datetime": pss_regrid.time.values,
-                    f"SCA_{model}_m2": model_snow,
-                    f"masked_area_{model}_m2": model_masked,
-                    f"valid_area_{model}_m2": model_valid,
-                    f"SCA_PSS-{model}-regrid_m2": pss_regrid_snow,
-                    f"masked_area_PSS-{model}-regrid_m2": pss_regrid_masked,
-                    f"valid_area_PSS-{model}-regrid_m2": pss_regrid_valid,
-                })
-                # round values cuz we're not that precise
-                sca_df.iloc[:, 2:] = sca_df.iloc[:, 2:].round()
-                sca_df.to_csv(sca_file, index=False, header=True)
-                print("SCA totals saved to:", sca_file)
-
-        # --- Confusion matrix ---
-        if os.path.exists(cm_file):
-            print("Confusion matrix time series exists, skipping:", cm_file)
-        else:
-            print("Calculating confusion matrix time series...")
-            with (
-                xr.open_dataset(mf).SCA.squeeze() as model_sca,
-                xr.open_dataset(pss_regrid_file).SCA.squeeze() as pss_regrid
-                ):
-                model_sca = model_sca.rio.write_crs(CRS)
-                model_sca = model_sca.sel(time=pss_regrid["time"], method="nearest")
-                cm_list = []
-                for i in range(len(model_sca["time"])):
-                    cm = calc_confusion_matrix(model_sca.isel(time=i), pss_regrid.isel(time=i))
-                    df = pd.DataFrame(cm, index=[0])
-                    df["datetime"] = pss_regrid.time.data[i]
-                    cm_list += [df]
-                cm_df = pd.concat(cm_list, ignore_index=True)
-                cm_df.to_csv(cm_file, index=False, header=True)
-                print("Confusion matrix time series saved to:", cm_file)
-
-        # --- Elevation/aspect binned SCA ---
-        if os.path.exists(recall_terrain_file):
-            print("Recall with binned terrain exists, skipping:", recall_terrain_file)
-        else:
-            print("Calculating recall with binned terrain...")
-            with (
-                xr.open_dataset(mf).SCA.squeeze() as model_sca,
-                xr.open_dataset(pss_regrid_file).SCA.squeeze() as pss_regrid
-                ):
-                # Sample model at PSS times
-                model_sca = model_sca.rio.write_crs(CRS)
-                model_sca = model_sca.sel(time=pss_regrid["time"], method="nearest")
-
-                # Reproject DEM to model grid
-                with rxr.open_rasterio(dem_file, masked=True).squeeze() as dem_da:
-                    dem_regrid_da = dem_da.rio.reproject_match(model_sca)
-
-                # Calculate aspect from regridded DEM
-                aspect_da = xrspatial.aspect(dem_regrid_da)
+            # --- Iterate over SWE thresholds ---
+            for swe_thresh in [0.0, 0.01, 0.02, 0.03, 0.04, 0.05]:
+                # Get input files
+                model_files = sorted(glob(os.path.join(model_sca_dir, f"{model}*Task{task}*SWEthresh{swe_thresh}m.nc")))
+                if not model_files:
+                    print(f"  No files found for {model}, Task {task}, SWE threshold {swe_thresh} m")
+                    continue
                 
-                # Calculate recall with elevation and aspect bins
-                recall_terrain_da = compute_recall_by_terrain(pss_regrid, model_sca, dem_regrid_da, aspect_da, elev_bins, aspect_bins)
+                mf = model_files[0]
+                model_name = "HMS" if "HMS" in model else model
 
-                # Save to file
-                recall_terrain_da.to_netcdf(recall_terrain_file)
-                print("Recall with binned terrain saved to:", recall_terrain_file)
+                # --- Define output files for this model---
+                pss_regrid_file = os.path.join(out_dir, f"PlanetScope_SCA_{model_name}_grid_fSCAthresh{fsca_threshold}.nc")
+                pss_regrid_sca_file = os.path.join(out_dir, f"SCA_totals_timeseries_PSS_{model_name}_grid.csv")
+                sca_file = os.path.join(out_dir, f"SCA_totals_timeseries_{model}_Task{task}_SWEthresh{swe_thresh}m.csv")
+                cm_file = os.path.join(out_dir, f"confusion_matrices_{model}_Task{task}_SWEthresh{swe_thresh}m.csv")
+                recall_terrain_file = os.path.join(out_dir, f"recall_binned_elev_aspect_{model}_Task{task}_SWEthresh{swe_thresh}m.nc")
+
+                # --- Regrid PlanetScope to model grid ---
+                if not os.path.exists(pss_regrid_file):
+                    print(f"Regridding PlanetScope SCA time series to {model_name} grid")
+                    _ = load_and_reproject_pss_sca(pss_sca_files, mf, pss_regrid_file, threshold=fsca_threshold)
+                else:
+                    print("Regridded PlanetScope SCA time series already exists, skipping.")
+
+                # --- SCA totals ---
+                if os.path.exists(sca_file):
+                    print(f"SCA totals CSV exists, skipping: {sca_file}")
+                else:
+                    with (
+                        xr.open_dataset(mf).SCA.squeeze() as model_sca,
+                        xr.open_dataset(pss_regrid_file).SCA.squeeze() as pss_regrid
+                        ):
+                        # Set no data values to NaN
+                        model_sca = xr.where(model_sca == 255, np.nan, model_sca)
+                        pss_regrid = xr.where(pss_regrid == 255, np.nan, pss_regrid)
+
+                        # Model areas time series
+                        model_sca = model_sca.rio.write_crs(CRS)
+                        model_sca = model_sca.sel(time=pss_regrid["time"], method="nearest")
+                        model_snow, model_masked, model_valid = sca_and_masked_area(model_sca)
+
+                        # Compile in DataFrames
+                        sca_df = pd.DataFrame({
+                            "datetime": pss_regrid.time.values,
+                            f"SCA_{model}_m2": model_snow,
+                            f"masked_area_{model}_m2": model_masked,
+                            f"valid_area_{model}_m2": model_valid,
+                        })
+                        # round values cuz we're not that precise
+                        sca_df.iloc[:, 2:] = sca_df.iloc[:, 2:].round()
+                        sca_df.to_csv(sca_file, index=False, header=True)
+                        print("SCA totals saved to:", sca_file)
+
+                        # PlanetScope regridded areas time series
+                        if not os.path.exists(pss_regrid_sca_file):
+                            pss_regrid_snow, pss_regrid_masked, pss_regrid_valid = sca_and_masked_area(pss_regrid)
+                            pss_sca_df = pd.DataFrame({
+                                "datetime": pss_regrid.time.values,
+                                f"SCA_PSS-{model_name}-grid_m2": pss_regrid_snow,
+                                f"masked_area_PSS-{model_name}-grid_m2": pss_regrid_masked,
+                                f"valid_area_PSS-{model_name}-grid_m2": pss_regrid_valid,
+                            })
+                            # round values cuz we're not that precise
+                            pss_sca_df.iloc[:, 2:] = pss_sca_df.iloc[:, 2:].round()
+                            pss_sca_df.to_csv(pss_regrid_sca_file, index=False, header=True)
+                            print("PSS SCA totals saved to:", sca_file)
+
+                # --- Confusion matrix ---
+                if os.path.exists(cm_file):
+                    print("Confusion matrix time series exists, skipping:", cm_file)
+                else:
+                    print("Calculating confusion matrix time series...")
+                    with (
+                        xr.open_dataset(mf).SCA.squeeze() as model_sca,
+                        xr.open_dataset(pss_regrid_file).SCA.squeeze() as pss_regrid
+                        ):
+                        model_sca = model_sca.rio.write_crs(CRS)
+                        model_sca = model_sca.sel(time=pss_regrid["time"], method="nearest")
+                        cm_list = []
+                        for i in range(len(model_sca["time"])):
+                            cm = calc_confusion_matrix(model_sca.isel(time=i), pss_regrid.isel(time=i))
+                            df = pd.DataFrame(cm, index=[0])
+                            df["datetime"] = pss_regrid.time.data[i]
+                            cm_list += [df]
+                        cm_df = pd.concat(cm_list, ignore_index=True)
+                        cm_df.to_csv(cm_file, index=False, header=True)
+                        print("Confusion matrix time series saved to:", cm_file)
+
+                # --- Elevation/aspect binned SCA ---
+                if os.path.exists(recall_terrain_file):
+                    print("Recall with binned terrain exists, skipping:", recall_terrain_file)
+                else:
+                    print("Calculating recall with binned terrain...")
+                    with (
+                        xr.open_dataset(mf).SCA.squeeze() as model_sca,
+                        xr.open_dataset(pss_regrid_file).SCA.squeeze() as pss_regrid
+                        ):
+                        # Sample model at PSS times
+                        model_sca = model_sca.rio.write_crs(CRS)
+                        model_sca = model_sca.sel(time=pss_regrid["time"], method="nearest")
+
+                        # Reproject DEM to model grid
+                        with rxr.open_rasterio(dem_file, masked=True).squeeze() as dem_da:
+                            dem_regrid_da = dem_da.rio.reproject_match(model_sca)
+
+                        # Calculate aspect from regridded DEM
+                        aspect_da = xrspatial.aspect(dem_regrid_da)
+                        
+                        # Calculate recall with elevation and aspect bins
+                        recall_terrain_da = compute_recall_by_terrain(pss_regrid, model_sca, dem_regrid_da, aspect_da, elev_bins, aspect_bins)
+
+                        # Save to file
+                        recall_terrain_da.to_netcdf(recall_terrain_file)
+                        print("Recall with binned terrain saved to:", recall_terrain_file)
 
 
-    # --- Compile SCA time series ---
-    print("\nCompiling SCA totals CSVs...")
-    sca_compiled_file = os.path.join(out_dir, "SCA_totals_timeseries_compiled.csv")
-    if not os.path.exists(sca_compiled_file):
+        # --- Compile stats ---
+        print("\nCompiling stats...")
 
-        # Get SCA time series CSVs
-        sca_files = sorted(glob(os.path.join(out_dir, "SCA*.csv")))
-        print(len(sca_files))
-        
-        # Loop over files
-        sca_df = None
-        for i, file in enumerate(sca_files):
-            df = pd.read_csv(file)
+        # SCA TIME SERIES
+        sca_compiled_file = os.path.join(out_dir, f"SCA_totals_timeseries_compiled_Task{task}.csv")
+        if not os.path.exists(sca_compiled_file):
 
-            if type(sca_df)!=pd.DataFrame:
-                sca_df = df
+            sca_files = sorted(glob(os.path.join(out_dir, f"SCA_totals_timeseries_*Task{task}*.csv")))
+            pss_files = sorted(glob(os.path.join(out_dir, f"SCA_totals_timeseries_PSS_*_grid.csv")))
+
+            # Load model SCA dataframes
+            model_dfs = []
+            for f in sca_files:
+                if "PSS" in f:
+                    continue
+                df = pd.read_csv(f)
+                df['datetime'] = pd.to_datetime(df['datetime'])
+                sca_col = [col for col in df.columns if col.startswith("SCA_") and col.endswith("_m2")][0]
+                df = df[["datetime", sca_col]]
+                df = df.rename(columns={sca_col: "SCA_m2"})
+                df['dataset'] = os.path.basename(f).split('_')[3]
+                df['task'] = int(os.path.basename(f).split('_')[4].replace('Task',''))
+                df['SWE_thresh'] = float(os.path.basename(f).split('_')[5].replace('.csv','').replace('SWEthresh','').replace('m',''))
+                model_dfs.append(df)
+
+            # Concatenate all model dataframes
+            sca_merged_df = pd.concat(model_dfs, ignore_index=True)
+
+            # Group by datetime and dataset, compute stats
+            stats_df = (
+                sca_merged_df
+                .groupby(['datetime', 'dataset'])['SCA_m2']
+                .agg(['min', 'max', 'mean', 'std'])
+                .reset_index()
+            )
+
+            # Pivot so each dataset's stats are columns
+            wide_df = stats_df.pivot(index='datetime', columns='dataset')
+            wide_df.columns = [f"{ds}_SCA_{stat}_m2" for stat, ds in wide_df.columns]
+            wide_df = wide_df.reset_index()
+
+            # Load and adjust all PSS SCA dataframes
+            pss_adj_cols = []
+
+            fig, ax = plt.subplots()
+
+            for q, f in enumerate(pss_files):
+                df = pd.read_csv(f)
+                df['datetime'] = pd.to_datetime(df['datetime'])
+                sca_col = [col for col in df.columns if col.startswith("SCA_PSS")][0]
+                masked_col = [col for col in df.columns if col.startswith("masked_area_PSS")][0]
+
+                # Account for masked area
+                min_masked = df[masked_col].min()
+                df["SCA_PSS_adj"] = df[sca_col] - (df[masked_col] - min_masked)
+                grid_name = os.path.basename(f).split("_grid")[0].replace("SCA_totals_timeseries_PSS_", "")
+                df = df[["datetime", "SCA_PSS_adj"]].rename(columns={"SCA_PSS_adj": "SCA_m2"})
+                df['grid'] = grid_name
+                pss_adj_cols.append(df)
+
+                ax.plot(df['datetime'], df['SCA_m2'], '-', color=plt.cm.jet(q/len(pss_files)), label=os.path.basename(f))
+            plt.show()
+
+            # Concatenate
+            pss_merged = pd.concat(pss_adj_cols, ignore_index=True)
+            
+            # Calculate summary stats for each datetime
+            stats = ['min', 'max', 'mean', 'std']
+            pss_stats_df = (
+                pss_merged
+                .groupby(['datetime'])['SCA_m2']
+                .agg(stats)
+                .reset_index()
+            )
+            pss_stats_df.rename(columns={stat: f"PSS_SCA_{stat}_m2" for stat in stats}, inplace=True)
+
+            # Merge model and PSS SCA columns
+            if not wide_df.empty and not pss_stats_df.empty:
+                all_sca = pd.merge(wide_df, pss_stats_df, on="datetime", how="outer")
+            elif not wide_df.empty:
+                all_sca = wide_df
+            elif not pss_stats_df.empty:
+                all_sca = pss_stats_df
             else:
-                sca_df = pd.merge(sca_df, df, on='datetime')
+                print("No SCA data found for this task.")
+                continue
 
-        # Save to file
-        sca_df = sca_df.sort_index(axis=1)
-        sca_df = sca_df.set_index('datetime')
-        sca_df.to_csv(sca_compiled_file, index=True)
-        print("Compiled SCA time series saved to:", sca_compiled_file)
+            # Save summary table
+            # all_sca.to_csv(sca_compiled_file, index=False)
+            # print("Saved SCA summary statistics to:", sca_compiled_file)
 
-    else:
-        print("Compiled SCA time series already exists, skipping.")
+
+
 
 if __name__ == "__main__":
     main()
