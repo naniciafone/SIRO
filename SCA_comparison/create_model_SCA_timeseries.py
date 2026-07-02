@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 
 """
-Create snow-covered area (SCA) time series for HEC-HMS, iSnobal, and SnowModel
+Create snow-covered area (SCA) time series for HEC-HMS, iSnobal, and SnowModel.
 
 Rainey Aberle (rainey.aberle@usace.army.mil)
+Snow-Informed Reservoir Operations (SIRO)
 USACE-ERDC-CRREL
 May 2026
 """
@@ -56,7 +57,10 @@ def swe_to_sca(files=None, swe_thresh=0.01, out_file=None, clip_gdf=None):
                 dt = np.datetime64(date)
                 sca = sca.expand_dims(time=[dt])
             elif "iSnobal" in os.path.basename(out_file):
-                date = os.path.splitext(os.path.basename(file))[0].split("mores_creek_SWE_")[1]
+                if task==1:
+                    date = os.path.splitext(os.path.basename(file))[0].split("mores_creek_SWE_")[1]
+                else:
+                    date = os.path.splitext(os.path.basename(file))[0].split("mores_creek_swe_")[1]
                 date = date[0:13] + ':' + date[14:16] + ':' + date[17:]
                 dt = np.datetime64(date)
                 sca = sca.expand_dims(time=[dt])
