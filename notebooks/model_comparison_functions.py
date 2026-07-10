@@ -79,7 +79,12 @@ def process_all_dates(parent_dir, task_number):
         if raster:
             modeled_data[date_str]['lidar'] = raster[0]
 
-            # create dcitionary of outputs clipped to basin
+        # create lidar 2000-m dictionary
+        raster = glob.glob(os.path.join(output_dir, "*LiDAR_2000_MCS_clip*.tif"))
+        if raster:
+            modeled_data[date_str]['lidar_2000'] = raster[0]
+
+        # create dcitionary of outputs clipped to basin
         models_basin = {}
         raster_search_pattern = os.path.join(output_dir, "*_basin_clip.tif")
         for raster_path in glob.glob(raster_search_pattern):
