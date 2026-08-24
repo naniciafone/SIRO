@@ -15,7 +15,8 @@ from rasterio.warp import reproject, Resampling
 
 
 
-# set up directories
+# This script can be stored within the date parent directory (ie. "/20240405")
+## Note: task number must be changed to process task 1 or task 2 outputs
 dir = "."
 Task_number = 2
 
@@ -29,13 +30,20 @@ if Task_number == 1:
 else:
     out_dir = os.path.join(dir, "outputs/task2/")
 
+##set up output directory structure for processed rasters and figures
 rasters_dir = os.path.join(out_dir, "rasters/")
 figs_dir = os.path.join(out_dir, "figs/")
 
-#call lidar
-lidar = glob.glob(os.path.join(dir, "lidar","*SNEX*"))
+#call lidar datasets. Two LiDAR datasets exits: one is 2-km scale, the other is 100-m. HMS outputs will be reresampled to 2-km products.
+lidar = glob.glob(os.path.join(dir, "lidar","*SD.tif"))
+lidar_2000 = glob.glob(os.path.join(dir, "lidar","*2000*"))
+if not lidar:
+    raise FileNotFoundError("No SD lidar raster found")
 
-# Split by underscore and pick the part that looks like a date
+if not lidar_2000:
+    raise FileNotFoundError("No 2000 m lidar raster found")
+
+# Pull the date from the 100-m LiDAR dataset. This is to build file names
 parts = os.path.basename(lidar[0]).split("_")
 for part in parts:
     if part.isdigit() and len(part) == 8:
@@ -43,11 +51,11 @@ for part in parts:
         break
 
 date_obj = datetime.strptime(date_str, "%Y%m%d")
-outfile = os.path.join(rasters_dir, "lidar_sd_"+date_str+".tif")
+outfile_100 = os.path.join(rasters_dir, "lidar_sd_"+date_str+".tif")
 
-if os.path.exists(outfile):
-    print(f"Skipping existing LiDAR raster: {outfile}")
-    lidar_raster = outfile
+if os.path.exists(outfile_100):
+    print(f"Skipping existing LiDAR raster: {outfile_100}")
+    lidar_raster = outfile_100
 else:
     with rasterio.open(lidar[0]) as src:
         data = src.read(1, masked=True)
@@ -58,20 +66,40 @@ else:
     data_filled = np.where(np.isnan(data), -9999, data)
 
     # Write the new raster
-    with rasterio.open(outfile, "w", **profile) as dst:
+    with rasterio.open(outfile_100, "w", **profile) as dst:
         dst.write(data_filled.astype("float32"), 1)
         
-    lidar_raster = outfile
+    lidar_raster = outfile_100
 
+#Do the same for the 2-km LiDAR raster
+    
+outfile_2000 = os.path.join(rasters_dir, "lidar_sd_"+date_str+"_2000.tif")
 
+if os.path.exists(outfile_2000):
+    print(f"Skipping existing LiDAR raster: {outfile_2000}")
+    lidar_raster_2000 = outfile_2000
+else:
+    with rasterio.open(lidar_2000[0]) as src:
+        data = src.read(1, masked=True)
+        profile = src.profile
+        profile.update(dtype=rasterio.float32, nodata=-9999)
 
+    #Replace NaNs with -9999
+    data_filled = np.where(np.isnan(data), -9999, data)
 
-HMS_EB = glob.glob(os.path.join(modeled, "*EB_snow*.tif"))[0]
+    # Write the new raster
+    with rasterio.open(outfile_2000, "w", **profile) as dst:
+        dst.write(data_filled.astype("float32"), 1)
+        
+    lidar_raster_2000 = outfile_2000
+
+HMS_EB = glob.glob(os.path.join(modeled, "*eb_snow*.tiff"))[0]
+
 HMS_TI = glob.glob(os.path.join(modeled, "*TI_snow*.tif"))[0]
 
 out_path = os.path.join(modeled, "HMS_EB_inches.tif")
 if os.path.exists(out_path):
-    print(f"Skipping existing LiDAR raster: {outfile}")
+    print(f"Skipping existing raster: {out_path}")
 else:
     with rasterio.open(HMS_EB) as src:
         raster_data = src.read(1, masked=True).filled(np.nan)
@@ -90,7 +118,7 @@ else:
 
 out_path = os.path.join(modeled, "HMS_TI_inches.tif")
 if os.path.exists(out_path):
-    print(f"Skipping existing LiDAR raster: {outfile}")
+    print(f"Skipping existing raster: {out_path}")
 else:
     with rasterio.open(HMS_TI) as src:
         raster_data = src.read(1, masked=True).filled(np.nan)
@@ -111,7 +139,7 @@ else:
 rasters = {
     "HMS_EB": glob.glob(os.path.join(modeled, "*EB_inches*.tif")),
     "HMS_TI": glob.glob(os.path.join(modeled, "*TI_inches*.tif")),
-    "iSnobal": glob.glob(os.path.join(modeled, "*thickness*.tif")),
+    "iSnobal": glob.glob(os.path.join(modeled, "*mores_creek*.tif")),
     "SnowModel": glob.glob(os.path.join(modeled, "*snod*.tif")),
 }
 
@@ -187,7 +215,7 @@ rasters = {
 
 lidar_shp = gpd.read_file(os.path.join(dir, "MCS_outline/MCS_outline.shp"))
 
-fig, axes = plt.subplots(2, 2, figsize=(8, 10), sharex=True, sharey=True)
+fig, axes = plt.subplots(2, 2, figsize=(8, 10), sharex=True, sharey=True, constrained_layout=True)
 axes = axes.flatten()  # flatten to 1D array for easy looping
 
 for i, (model, raster_list) in enumerate(rasters.items()):
@@ -207,34 +235,25 @@ for i, (model, raster_list) in enumerate(rasters.items()):
 
 # Add colorbar
 
-#fig.colorbar(im, ax=axes, orientation="vertical", fraction=0.02, extend="max", label="Snow Depth")
-
 # --- 5. Add a single, shared colorbar ---
-fig.tight_layout(rect=[0, 0, 0.9, 0.95]) # Adjust layout to make space
 
 # Add axes for the colorbar [left, bottom, width, height]
 cbar_ax = fig.add_axes([0.92, 0.15, 0.025, 0.7])
 cbar = fig.colorbar(im, cax=cbar_ax)
 cbar.set_label('Snow Depth (m)', fontsize=14)
 
-fig.suptitle(f"Mores Creek Basin Snow Depth, {date_obj.strftime('%B %d, %Y')}", fontsize=16,  y=0.95)
+fig.suptitle(f"Mores Creek Basin Snow Depth, {date_obj.strftime('%B %d, %Y')}", fontsize=16)
 
 fig.subplots_adjust(
     wspace=0.05,
     hspace=0.06,
     right=0.88
-    #top=0.90
+
 )
 
 plt.savefig(os.path.join(figs_dir, "Basin_models.png"), dpi=300, bbox_inches="tight")
 
 plt.show()
-
-
-
-
-# In[21]:
-
 
 dfs = []
 
@@ -302,9 +321,10 @@ with fiona.open(MCS, "r") as shapefile:
 rasters = {
     "HMS_EB": glob.glob(os.path.join(modeled, "*EB_inches*.tif")),
     "HMS_TI": glob.glob(os.path.join(modeled, "*TI_inches*.tif")),
-    "iSnobal": glob.glob(os.path.join(modeled, "*thickness*.tif")),
+    "iSnobal": glob.glob(os.path.join(modeled, "*mores_creek*.tif")),
     "SnowModel": glob.glob(os.path.join(modeled, "*snod*.tif")),
-    "LiDAR": [lidar_raster]
+    "LiDAR": [lidar_raster],
+    "LiDAR_2000": [lidar_raster_2000]
 }
 
 
@@ -368,7 +388,8 @@ rasters = {
     "HMS Temperature Index": os.path.join(rasters_dir, "HMS_TI_MCS_clip.tif"),
     "iSnobal": os.path.join(rasters_dir, "iSnobal_MCS_clip.tif"),
     "SnowModel": os.path.join(rasters_dir, "SnowModel_MCS_clip.tif"),
-    "LiDAR": os.path.join(rasters_dir, "LiDAR_MCS_clip.tif")
+    "LiDAR": lidar_raster,
+    "LiDAR_2000": lidar_raster_2000
 }
 
 
@@ -403,8 +424,6 @@ fig.suptitle(f"Mores Creek Summit Snow Depth, {date_obj.strftime('%B %d, %Y')}",
 plt.savefig(os.path.join(figs_dir, "MCS_models.png"), dpi=300, bbox_inches="tight")
 
 plt.show()
-
-
 
 
 dfs = []
@@ -463,64 +482,77 @@ plt.savefig(os.path.join(figs_dir, "MCS_boxplot.png"), dpi=300, bbox_inches="tig
 plt.show()
 
 
+##resample and difference models with LiDAR
+## 100-m is lidar_raster, 2-km raster is lidar_raster_2000
+##need to remove lidar form rasters dictionary
 
-del rasters["LiDAR"]
+rasters = {
+    "HMS Energy Balance": "HMS_EB_MCS_clip.tif",
+    "HMS Temperature Index": "HMS_TI_MCS_clip.tif",
+    "iSnobal": "iSnobal_MCS_clip.tif",
+    "SnowModel": "SnowModel_MCS_clip.tif",
+}
+
 lidar = os.path.join(rasters_dir, "LiDAR_MCS_clip.tif")
+lidar_2000 = os.path.join(rasters_dir, "LiDAR_2000_MCS_clip.tif")
 
+for model, filename in rasters.items():
 
-with rasterio.open(lidar) as src:
-    lidar_data = src.read(1, masked=True)
-    profile = src.profile                 # for writing outputs
-    lidar_crs = src.crs
-    lidar_transform = src.transform  # True where LiDAR is masked
+    lidar_path = lidar_2000 if "HMS" in model else lidar
+    model_path = os.path.join(rasters_dir, filename)
 
+    with rasterio.open(lidar_path) as lidar_src, rasterio.open(model_path) as model_src:
 
-for model, raster_path in rasters.items():
-    with rasterio.open(raster_path) as src:
-        model_data = src.read(1, masked=True)
-        model_transform = src.transform
-        model_crs = src.crs
+        lidar_data = lidar_src.read(1, masked=True)
 
-        # Assign CRS if missing
-        if model_crs is None:
-            model_crs = lidar_crs
-            print(f"Assigned CRS {model_crs} to {model} because it was missing.")
-
-        # Prepare array for reprojected data
-        reprojected_model = np.empty(lidar_data.shape, dtype=np.float32)
-
-        # Reproject/resample model to match LiDAR
-        reproject(
-            source=model_data,
-            destination=reprojected_model,
-            src_transform=model_transform,
-            src_crs=model_crs,
-            dst_transform=lidar_transform,
-            dst_crs=lidar_crs,
-            resampling=Resampling.bilinear
+        reprojected = np.full(
+            lidar_data.shape,
+            -9999,
+            dtype=np.float32
         )
 
-        # Mask wherever either raster is NaN / masked
-        combined_mask = (lidar_data.data == -9999) | (reprojected_model == -9999)
-        model_masked = np.ma.array(reprojected_model, mask=combined_mask)
-        lidar_masked = np.ma.array(lidar_data, mask=combined_mask)
+        reproject(
+            source=model_src.read(1),
+            destination=reprojected,
+            src_transform=model_src.transform,
+            src_crs=model_src.crs or lidar_src.crs,
+            dst_transform=lidar_src.transform,
+            dst_crs=lidar_src.crs,
+            src_nodata=-9999,
+            dst_nodata=-9999,
+            resampling=Resampling.nearest
+        )
 
-        # Compute difference
-        diff_data = lidar_masked - model_masked
+        mask = (
+            np.ma.getmaskarray(lidar_data)
+            | (reprojected == -9999)
+        )
 
-        # Write difference raster
-        out_profile = profile.copy()
-        out_profile.update(dtype=rasterio.float32, compress="lzw", nodata = -9999)
+        model_resampled = np.ma.array(reprojected, mask=mask)
+        diff = model_resampled - lidar_data
 
-        # Write difference raster
-        out_path_diff = os.path.join(rasters_dir, f"{model.replace(' ', '_')}_lidar_diff.tif")
-        out_path_resample = os.path.join(rasters_dir, f"{model.replace(' ', '_')}_lidar_resample.tif")
-        
-        with rasterio.open(out_path_resample, "w", **out_profile) as dst:
-            dst.write(model_masked.filled(np.nan).astype(np.float32), 1)
-        with rasterio.open(out_path_diff, "w", **out_profile) as dst:
-            dst.write(diff_data.filled(np.nan).astype(np.float32), 1)
+        profile = lidar_src.profile.copy()
+        profile.update(
+            dtype="float32",
+            nodata=-9999,
+            compress="lzw"
+        )
 
+    model_tag = model.replace(" ", "_")
+
+    with rasterio.open(
+        os.path.join(rasters_dir, f"{model_tag}_lidar_resample.tif"),
+        "w",
+        **profile
+    ) as dst:
+        dst.write(model_resampled.filled(-9999).astype(np.float32), 1)
+
+    with rasterio.open(
+        os.path.join(rasters_dir, f"{model_tag}_lidar_diff.tif"),
+        "w",
+        **profile
+    ) as dst:
+        dst.write(diff.filled(-9999).astype(np.float32), 1)
 
 
 
