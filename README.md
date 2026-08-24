@@ -36,7 +36,7 @@ Per a conversation with the HMS team, HMS was run at 2000-m and 100-m resolution
 Both TI and ET implementations of HMS are "heavily dependent on the resolution of the met data used as boundary condition". HRRR 
 data was already interpolated from 3-km to 2-km, adding "an artificial increase in precision but not accuracy". The HMS team therefore
 elected to run the model at 2,000-m resolution rather than 100-m, and I have resampled the data for model comparison.
-The resampling method can be found in [scripts/resample.py](scripts/resample.py).
+The resampling method can be found in [scripts/resample.py](scripts/resample_rasters.py).
 
 
 ## Preparation for Model Comparison
