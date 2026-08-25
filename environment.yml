@@ -12,6 +12,7 @@ dependencies:
   - xarray
   - rioxarray
   - xarray-spatial
+  - netcdf4
   - numpy
   - pandas
   - scipy
