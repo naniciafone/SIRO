@@ -1,0 +1,3 @@
+Note, I did my initial transformation to EPSG32611 via command line.I downloaded my SNODAS data after finding the URLs on NSIDC (https://nsidc.org/data/g02158/versions/1).
+
+After getting your URL list, use [01_SNODAS_URL_download](01_SNODAS_url_download.py) to download and unzip these files. From here, use [this link](https://nsidc.org/data/user-resources/help-center/how-do-i-convert-snodas-binary-files-geotiff-or-netcdf) 

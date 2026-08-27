@@ -36,7 +36,7 @@ Per a conversation with the HMS team, HMS was run at 2000-m and 100-m resolution
 Both TI and ET implementations of HMS are "heavily dependent on the resolution of the met data used as boundary condition". HRRR 
 data was already interpolated from 3-km to 2-km, adding "an artificial increase in precision but not accuracy". The HMS team therefore
 elected to run the model at 2,000-m resolution rather than 100-m, and I have resampled the data for model comparison.
-The resampling method can be found in [scripts/resample.py](scripts/resample.py).
+The resampling method can be found in [scripts/resample.py](scripts/resample_rasters.py).
 
 
 ## Preparation for Model Comparison
@@ -362,3 +362,31 @@ for model, raster_path in rasters.items():
 ```
 
 </details>
+
+### Year 1 Notes
+Units are not consistent across outputs. The units provided are as follows:
+
+**SWE Units**
+
+iSnobal = mm
+
+SnowModel = meters
+
+HMS = inches
+
+**SnowDepth Units**
+
+iSnobal = meters
+
+SnowModel = meters
+
+HMS = inches
+
+### Year 2 Recommendations
+
+- standardize time stamp of saved snow state (ie, 00:00 or 24:00). Also, I would reiterate the end date that you want, whether that is to June 30 or snow disappearance. 
+- netCDFs are best, but I'm not sure if HMS can output that file format. That said, I would request geotiffs for the LiDAR validation dates. There aren't too many LiDAR dates, and even fewer with ASO, so I think it's fine to ask for both netCDFs for the time series and TIFs for LiDAR validation dates.
+- If you do stick with Geotiffs, I'd ask for consistency with naming convention. I didn't specify, and I rely on my file structure to know what is Task1 or Task 2. I would request: "ModelName_WY##_Variable_Task#", where variable is SWE or SD.
+
+### To-Do's
+- Need to push data from my RDEPubDrive to another workspace

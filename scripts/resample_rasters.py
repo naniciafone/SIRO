@@ -3,6 +3,8 @@ from rasterio.enums import Resampling
 import os
 import glob
 
+###this script can be as a template for resampling directories of rasters
+
 dir = "."  
 target_resolution = 10
 raster_files = glob.glob(os.path.join(dir, '*.tif'))

@@ -8,7 +8,7 @@ from rasterio.mask import mask
 import re
 
 dir= "."
-raster_files = glob.glob(os.path.join(dir,"resampled", '*.tif'))
+raster_files = glob.glob(os.path.join(dir,'*.tif'))
 
 
 # Clip to Mores Creek basin outline
