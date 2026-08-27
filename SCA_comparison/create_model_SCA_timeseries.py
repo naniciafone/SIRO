@@ -3,7 +3,6 @@
 """
 Create snow-covered area (SCA) time series for HEC-HMS, iSnobal, and SnowModel.
 
-Rainey Aberle (rainey.aberle@usace.army.mil)
 Snow-Informed Reservoir Operations (SIRO)
 USACE-ERDC-CRREL
 May 2026

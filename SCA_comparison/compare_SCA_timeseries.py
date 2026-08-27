@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """
-Compare model- and satellite-derived snow-covered area (SCA) time series
+Compare model- and satellite-derived snow-covered area (SCA) time series.
+Updated to use SPIReS-MODIS/Terra fSCA product for validation.
 
-Rainey Aberle (rainey.aberle@usace.army.mil)
 Snow-Informed Reservoir Operations (SIRO)
 USACE-ERDC-CRREL
 July 2026
@@ -10,251 +10,55 @@ July 2026
 
 import os
 import numpy as np
-import pandas as pd
-import geopandas as gpd
 import xarray as xr
 import rioxarray as rxr
 from glob import glob
 from tqdm import tqdm
 import xrspatial
+import geopandas as gpd
 
 
 # ----- CONFIG -----
 # I/O
-base_dir = "/Users/rdcrlrka/Research/SIRO/MCS_SCA/"
-model_sca_dir = os.path.join(base_dir, "model_SCA")
-model_names = ["HMS-EB", "HMS-TI", "iSnobal", "SnowModel"]
-pss_sca_files = sorted(glob(os.path.join(base_dir, "PSS_SCA", "*.tif")))
-dem_file = os.path.join(base_dir, "..", "DEMs", "USGS_2026_DEM_merged.tif")
-aoi_file = os.path.join(base_dir, "..", "MCS_outline.gpkg")
-out_dir = os.path.join(base_dir, "SCA_comparison_results")
-os.makedirs(out_dir, exist_ok=True)
+BASE_DIR = "/Users/rdcrlrka/Research/SIRO/MCS_SCA/"
+MODEL_SCA_DIR = os.path.join(BASE_DIR, "model_SCA")
+FINE_RES_MODELS = ["iSnobal", "SnowModel"]  # 100 m native resolution
+COARSE_RES_MODELS = ["HMS-EB", "HMS-TI"]    # 2 km native resolution
+MODEL_NAMES = FINE_RES_MODELS + COARSE_RES_MODELS
 
-# Target resolution for all comparisons (meters)
-TARGET_RES = 100
+DEM_FILE = os.path.join(BASE_DIR, "..", "DEMs", "USGS_2026_DEM_merged.tif")
+AOI_FILE = os.path.join(BASE_DIR, "..", "MCS_outline.gpkg")
+OUT_DIR = os.path.join(BASE_DIR, "SCA_comparison_results_SPIReS")
+SPIRES_FSCA_FILE = os.path.join(OUT_DIR, "SPIReS_fSCA.nc")
+os.makedirs(OUT_DIR, exist_ok=True)
 
-# PlanetScope-specific params
-FSCA_THRESHOLD = 0.5                    # fSCA threshold after resampling
-TREE_MAX = 0.5                          # Max tree percentage to consider "valid" after resampling
-VALID_MIN = 0.5                         # Minimum percentage of classified pixels to consider "valid"
-RUN_THRESHOLD_SWEEP = False             # Run confusion matrix threshold sensitivity loop
-FSCA_SWEEP = np.arange(0.1, 1.01, 0.1)  # fSCA values to test
-CHUNKS = {'x': 2048, 'y': 2048}         # Read PSS files in chunks to prevent RAM overload
-CRS = "EPSG:32611"                      # Known CRS (projected, meters) for ALL rasters/grids
-TIME_TOL = np.timedelta64(1, "D")       # Max time difference between PlanetScope and models for comparison
-# classified image values
+
+# SPIReS product deets
+CHUNKS = {'x': 1024, 'y': 1024}
+CRS = "EPSG:32611"
+TIME_TOL = np.timedelta64(12, "h")  # Max time difference for temporal sampling
 NODATA_VAL = 255
-TREE_VAL = 2
-SNOW_VAL = 1
-NOSNOW_VAL = 0
 
 # Iterations
 TASKS = [1, 2]
 SWE_THRESHOLDS = [0.0, 0.01, 0.02, 0.03, 0.04, 0.05]
 
 # Output files
-PSS_FSCA_REGRID_FILE = os.path.join(out_dir, "fSCA_100m_PlanetScope.nc")
-PSS_TOTALS_NATIVE_FILE = os.path.join(out_dir, "SCA_totals_native_PlanetScope.csv")
-PSS_TOTALS_REGRID_FILE = os.path.join(out_dir, "SCA_totals_100m_PlanetScope.nc")
-SCA_MODELED_FILE = os.path.join(out_dir, "compiled_SCA_totals_100m_modeled.nc")
-CM_FILE = os.path.join(out_dir, "compiled_confusion_matrices.nc")
-RECALL_FILE = os.path.join(out_dir, "compiled_recall_binned_elev_aspect.nc")
+METRICS_FILE = os.path.join(OUT_DIR, "compiled_performance_metrics.nc")
+BINNED_METRICS_FILE = os.path.join(OUT_DIR, "compiled_metrics_binned_elev_aspect.nc")
+
+# Melt-out date settings
+MELT_OUT_FSCA_THRESH = 0.10   # fSCA (or binary SCA) threshold defining "snow covered"
+WATER_YEAR_START_MONTH = 10   # water year begins Oct 1
+MELT_OUT_METRICS_FILE = os.path.join(OUT_DIR, "compiled_melt_out_metrics.nc")
+MELT_OUT_GRIDS_FILE = os.path.join(OUT_DIR, "melt_out_dates_gridded.nc")
+MELT_OUT_BINNED_FILE = os.path.join(OUT_DIR, "compiled_melt_out_binned_elev_aspect.nc")
+SAVE_MELT_OUT_GRIDS = True    # also save full per-pixel melt-out DOWY grids (larger file)
+
 
 # ----- HELPER FUNCTIONS -----
-def reproject_fractional_sca(da_native, target_grid):
-    """
-    Resample a native-resolution PlanetScope land cover mask to the target grid.
-
-    Parameters
-    ----------
-    da_native : xr.DataArray
-        Native raster with values: 0=no snow, 1=snow, 2=tree, 255=nodata
-    target_grid : xr.DataArray
-        The target grid to match
-
-    Returns
-    -------
-    dict of xr.DataArray on the target grid:
-        'fsca'        : snow / (snow + no_snow). NaN where no certain (snow/no-snow) area exists.
-        'snow_frac'   : fraction of cell that is snow
-        'tree_frac'   : fraction of cell that is tree
-        'certain_frac': fraction of cell that is snow or no-snow
-        'valid_frac'  : fraction of cell that is any classified pixel
-    """
-    # Mark nodata as NaN
-    da = xr.where(da_native == NODATA_VAL, np.nan, da_native).astype("float32")
-
-    def _indicator(value):
-        ind = xr.where(np.isnan(da), np.nan, xr.where(da == value, 1.0, 0.0))
-        ind = ind.rio.write_crs(CRS)
-        ind = ind.rio.write_nodata(np.nan)
-        return ind
-
-    is_snow = _indicator(SNOW_VAL)
-    is_nosnow = _indicator(NOSNOW_VAL)
-    is_tree = _indicator(TREE_VAL)
-    is_valid = xr.where(np.isnan(da), np.nan, 1.0).rio.write_crs(CRS)
-    is_valid = is_valid.rio.write_nodata(np.nan)
-
-    # Calculate fractional coverage of each class on the target grid
-    snow_frac = is_snow.rio.reproject_match(target_grid, resampling='average')
-    nosnow_frac = is_nosnow.rio.reproject_match(target_grid, resampling='average')
-    tree_frac = is_tree.rio.reproject_match(target_grid, resampling='average')
-    valid_frac = is_valid.rio.reproject_match(target_grid, resampling='average')
-
-    # Calculate fSCA over known area only, i.e. tree-covered areas excluded.
-    certain_frac = snow_frac + nosnow_frac
-    fsca = xr.where(certain_frac > 0, snow_frac / certain_frac, np.nan)
-
-    return {
-        "fsca": fsca,
-        "snow_frac": snow_frac,
-        "tree_frac": tree_frac,
-        "certain_frac": certain_frac,
-        "valid_frac": valid_frac,
-    }
-
-
-def build_comparison_mask(
-        tree_frac, certain_frac, valid_frac, tree_max=TREE_MAX, valid_min=VALID_MIN
-        ):
-    """
-    Boolean mask on the target grid of cells valid for model/PSS comparison.
-    """
-    enough_valid = valid_frac >= valid_min
-    not_too_treed = tree_frac <= tree_max
-    has_certain = certain_frac > 0
-    return enough_valid & not_too_treed & has_certain
-
-
-def calculate_model_sca(model_binary, comp_mask, pixel_area):
-    """
-    Model area = binary model SCA (1=snow) summed over the common mask only.
-    """
-    m = model_binary.where(comp_mask)
-    snow = xr.where(m == 1, 1.0, 0.0).where(comp_mask).sum(dim=["x", "y"]).data
-    valid = xr.where(~np.isnan(m), 1.0, 0.0).sum(dim=["x", "y"]).data
-    return float(snow * pixel_area), float(valid * pixel_area)
-
-
-def calculate_planetscope_sca(snow_frac, certain_frac, valid_frac, comp_mask, pixel_area):
-    """
-    Compute PlanetScope SCA total and its uncertainty bounds for one timestamp
-    within the comparison mask.
-
-    Best estimate:
-        SCA = sum(snow_frac * pixel_area) over masked cells.
-
-    Uncertain area = the fraction of each masked cell whose snow status is NOT
-    certain (i.e. trees or partially/edge-classified area) = (1 - certain_frac).
-    Bounds assume the uncertain area is entirely no-snow (lower) or entirely
-    snow (upper):
-        SCA_lower = sum(snow_frac * pixel_area)
-        SCA_upper = sum((snow_frac + uncertain_frac) * pixel_area)
-
-    Returns dict of floats (m2).
-    """
-    sf = snow_frac.where(comp_mask)
-    cf = certain_frac.where(comp_mask)
-    vf = valid_frac.where(comp_mask)
-
-    uncertain_frac = (1.0 - cf).clip(min=0.0)  # trees + unclassified/edge
-
-    snow_area = float((sf * pixel_area).sum(dim=["x", "y"]).data)
-    certain_area = float((cf * pixel_area).sum(dim=["x", "y"]).data)
-    valid_area = float((vf * pixel_area).sum(dim=["x", "y"]).data)
-    uncertain_area = float((uncertain_frac * pixel_area).sum(dim=["x", "y"]).data)
-
-    return {
-        "SCA_m2": snow_area,
-        "SCA_lower_m2": snow_area,                      # uncertain -> all no-snow
-        "SCA_upper_m2": snow_area + uncertain_area,     # uncertain -> all snow
-        "uncertain_area_m2": uncertain_area,
-        "certain_area_m2": certain_area,
-        "valid_area_m2": valid_area,
-    }
-
-
-def load_and_reproject_pss_sca(
-    pss_files: list = None,
-    target_grid: xr.DataArray = None,
-    out_file: str = None,
-    chunks: dict = None,
-) -> xr.Dataset:
-
-    if not pss_files:
-        raise FileNotFoundError("pss_files list is empty.")
-    if chunks is None:
-        chunks = CHUNKS
-
-    if os.path.exists(out_file):
-        print(f"Output file already exists, loading: {out_file}")
-        return xr.open_dataset(out_file)
-
-    fsca_list, snowf_list, treef_list, certf_list, validf_list = [], [], [], [], []
-    for filepath in tqdm(sorted(pss_files)):
-        with rxr.open_rasterio(filepath, chunks=chunks).squeeze() as da:
-            da = da.rio.write_crs(CRS)
-
-            out = reproject_fractional_sca(da, target_grid)
-
-            date = os.path.basename(filepath).split("_")[0]
-            dt = np.datetime64(date)
-            for key, lst in (
-                ("fsca", fsca_list), ("snow_frac", snowf_list),
-                ("tree_frac", treef_list), ("certain_frac", certf_list),
-                ("valid_frac", validf_list),
-            ):
-                arr = out[key].assign_coords(time=dt).expand_dims("time")
-                lst.append(arr)
-
-    def _concat(lst, name):
-        c = xr.concat(lst, dim="time").sortby("time").rio.write_crs(CRS)
-        c.name = name
-        return c
-
-    ds = xr.Dataset({
-        "fsca": _concat(fsca_list, "fsca"),
-        "snow_frac": _concat(snowf_list, "snow_frac"),
-        "tree_frac": _concat(treef_list, "tree_frac"),
-        "certain_frac": _concat(certf_list, "certain_frac"),
-        "valid_frac": _concat(validf_list, "valid_frac"),
-    })
-    ds = ds.rio.write_crs(CRS)
-    ds.attrs.update({
-        "long_name": "Fractional snow-covered area fields on target grid",
-        "fsca_definition": "snow / (snow + no_snow); trees EXCLUDED from denominator",
-        "grid_resolution_m": TARGET_RES,
-        "note": "Trees are not assumed snow-covered; they are excluded from comparison.",
-    })
-
-    ds.to_netcdf(out_file)
-    print("Saved regridded PlanetScope fractional fields to:", out_file)
-    return ds
-
-
-def calculate_confusion_matrix(model_binary, ref_binary, comp_mask=None):
-    """
-    NOTE: relies on model_binary/ref_binary preserving NaN for nodata/invalid
-    cells (do NOT pre-binarize NaN model cells to 0 before calling this).
-    """
-    m = model_binary.data.ravel().astype("float32")
-    r = ref_binary.data.ravel().astype("float32")
-    valid = ~np.isnan(m) & ~np.isnan(r)
-    if comp_mask is not None:
-        valid &= comp_mask.data.ravel().astype(bool)
-    m = m[valid].astype(bool)
-    r = r[valid].astype(bool)
-
-    # Calculate True/False Positives/Negatives
-    tp = int(np.sum(m & r))
-    tn = int(np.sum(~m & ~r))
-    fp = int(np.sum(m & ~r))
-    fn = int(np.sum(~m & r))
-    return {"TP": tp, "TN": tn, "FP": fp, "FN": fn}
-
-
-def get_elev_bins(dem_da, bin_width=50):
+def get_elev_bins(dem_da, bin_width=100):
+    """Generate elevation bins for stratified analysis."""
     min_elev = np.nanmin(dem_da.data)
     max_elev = np.nanmax(dem_da.data)
     start = bin_width * (min_elev // bin_width)
@@ -262,455 +66,731 @@ def get_elev_bins(dem_da, bin_width=50):
     return np.arange(start, end + bin_width, bin_width)
 
 
-def calculate_recall_with_terrain(
-        pss_binary, model_binary, elev_da, aspect_da, elev_bins, aspect_bins, comp_mask
+def calculate_fsca_metrics(model_fsca, ref_fsca):
+    """
+    Calculate total fSCA performance metrics for fine-resolution models.
+    Metrics are scaled to 0-100 where applicable.
+
+    Parameters
+    ----------
+    model_fsca : xr.DataArray
+        Model fractional snow cover (0-1)
+    ref_fsca : xr.DataArray
+        Reference (SPIReS) fractional snow cover (0-1)
+
+    Returns
+    -------
+    xr.Dataset : Performance metrics as time series
+    """
+
+    # Calculate error metrics
+    error = (model_fsca - ref_fsca) * 100
+    rmse = ((error**2).mean(dim=['x', 'y']) ** 0.5)
+    mae = (abs(error).mean(dim=['x', 'y']))
+    bias = error.mean(dim=['x', 'y'])
+
+    # Basin-averaged fSCA errors and correlation
+    model_fsca_mean = model_fsca.mean(dim=['x', 'y']) 
+    ref_fsca_mean = ref_fsca.mean(dim=['x', 'y'])
+    fsca_average_error = (model_fsca_mean - ref_fsca_mean) * 100
+    
+    # Calculate correlation as a time series
+    def _calculate_corr(a, b):
+        # Flatten and remove NaNs
+        a_flat = a.flatten()
+        b_flat = b.flatten()
+        valid_mask = ~np.isnan(a_flat) & ~np.isnan(b_flat)
+        a_valid = a_flat[valid_mask]
+        b_valid = b_flat[valid_mask]
+
+        if a_valid.size < 2 or np.all(a_valid == a_valid[0]) or np.all(b_valid == b_valid[0]):
+             return np.nan
+        return np.corrcoef(a_valid, b_valid)[0, 1]
+
+    correlation_list = []
+    for t_idx in range(model_fsca.sizes['time']):
+        model_slice = model_fsca.isel(time=t_idx).values
+        ref_slice = ref_fsca.isel(time=t_idx).values
+        correlation_list.append(_calculate_corr(model_slice, ref_slice))
+
+    correlation = xr.DataArray(
+        correlation_list, 
+        dims=["time"], 
+        coords={"time": model_fsca.time}
+    )
+
+    return xr.Dataset({
+        'RMSE': rmse,
+        'MAE': mae,
+        'bias': bias,
+        'fSCA_average_error': fsca_average_error,
+        'correlation': correlation,
+        })
+
+
+
+def calculate_partial_credit_error(model_binary, ref_fsca):
+    """
+    Calculate partial credit error for coarse-resolution binary SCA,
+    where 0 = perfect agreement and 1 = no agreement.
+
+    For each model pixel:
+    - If model = 1 (snow): error = 1 - mean(ref_fsca)
+    - If model = 0 (no snow): error = mean(ref_fsca)
+
+    Parameters
+    ----------
+    model_binary : xr.DataArray
+        Binary model SCA (0 or 1), dims (time, y, x)
+    ref_fsca : xr.DataArray
+        Reference fSCA (0-1), dims (time, y, x)
+
+    Returns
+    -------
+    xr.Dataset : Partial credit error as a time series
+    """
+
+    # Create masks for valid data
+    valid_mask = ~np.isnan(model_binary) & ~np.isnan(ref_fsca)
+
+    # Snow and no-snow masks
+    snow_mask = (model_binary == 1) & valid_mask
+    nosnow_mask = (model_binary == 0) & valid_mask
+
+    # Calculate errors
+    # For snow pixels: error = 1 - ref_fsca
+    # For no-snow pixels: error = ref_fsca
+    errors = xr.where(
+        snow_mask, 1 - ref_fsca, xr.where(nosnow_mask, ref_fsca, np.nan)
+        )
+
+    # Overall partial credit error, scaled to 0-100
+    partial_credit_error = errors.mean(dim=['x', 'y']) * 100
+
+    return xr.Dataset({'partial_credit_error': partial_credit_error})
+
+
+def calculate_metrics_binned(
+        model_data, ref_fsca, elev_da, aspect_da, elev_bins, aspect_bins, is_binary=False
         ):
+    """
+    Calculate performance metrics binned by elevation and aspect.
+
+    Parameters
+    ----------
+    model_data : xr.DataArray
+        Model fSCA (fine-res) or binary SCA (coarse-res)
+    ref_fsca : xr.DataArray
+        Reference fSCA
+    elev_da, aspect_da : xr.DataArray
+        Elevation and aspect grids
+    elev_bins, aspect_bins : array-like
+        Bin edges
+    is_binary : bool
+        If True, use partial credit error; if False, use fSCA metrics
+
+    Returns
+    -------
+    xr.Dataset with binned metrics
+    """
     elev_bin_idx = np.digitize(elev_da.values, elev_bins) - 1
     aspect_bin_idx = np.digitize(aspect_da.values, aspect_bins) - 1
     n_elev_bins = len(elev_bins) - 1
     n_aspect_bins = len(aspect_bins) - 1
-    n_time = pss_binary.sizes["time"]
+    n_time = model_data.sizes["time"]
 
-    recall = np.full((n_time, n_elev_bins, n_aspect_bins), np.nan)
-    cmask = comp_mask.values if comp_mask is not None else np.ones_like(elev_da.values, bool)
+    if is_binary:
+        metric_names = ["partial_credit_error", "n_pixels"]
+        metrics = {k: np.full((n_time, n_elev_bins, n_aspect_bins), np.nan)
+                   for k in metric_names}
+    else:
+        metric_names = ["RMSE", "MAE", "correlation", "n_pixels"]
+        metrics = {k: np.full((n_time, n_elev_bins, n_aspect_bins), np.nan)
+                   for k in metric_names}
+
     for i in range(n_time):
-        sat = pss_binary.isel(time=i).values
-        mod = model_binary.isel(time=i).values
-        cell_mask_i = cmask[i] if cmask.ndim == 3 else cmask
+        mod = model_data.isel(time=i).values
+        ref = ref_fsca.isel(time=i).values
+
         for j in range(n_elev_bins):
             for k in range(n_aspect_bins):
-                mask = (elev_bin_idx == j) & (aspect_bin_idx == k) & cell_mask_i
-                tp = np.nansum((sat[mask] == 1) & (mod[mask] == 1))
-                fn = np.nansum((sat[mask] == 1) & (mod[mask] == 0))
-                denom = tp + fn
-                recall[i, j, k] = tp / denom if denom > 0 else np.nan
+                bin_mask = (elev_bin_idx == j) & (aspect_bin_idx == k)
 
-    recall_da = xr.DataArray(
-        recall,
-        dims=["time", "elev_bin", "aspect_bin"],
+                if not np.any(bin_mask):
+                    continue
+
+                mod_bin = mod[bin_mask]
+                ref_bin = ref[bin_mask]
+                valid = ~np.isnan(mod_bin) & ~np.isnan(ref_bin)
+
+                if not np.any(valid):
+                    continue
+
+                mod_valid = mod_bin[valid]
+                ref_valid = ref_bin[valid]
+
+                if is_binary:
+                    snow_mask = mod_valid == 1
+                    errors = np.where(snow_mask, 1 - ref_valid, ref_valid)
+                    metrics["partial_credit_error"][i, j, k] = np.mean(errors) * 100
+                    metrics["n_pixels"][i, j, k] = len(mod_valid)
+                else:
+                    diff = mod_valid - ref_valid
+                    metrics["RMSE"][i, j, k] = np.sqrt(np.mean(diff**2)) * 100
+                    metrics["MAE"][i, j, k] = np.mean(np.abs(diff)) * 100
+                    if np.std(mod_valid) > 0 and np.std(ref_valid) > 0:
+                        metrics["correlation"][i, j, k] = np.corrcoef(mod_valid, ref_valid)[0, 1]
+                    metrics["n_pixels"][i, j, k] = len(mod_valid)
+
+    # Create dataset
+    data_vars = {}
+    for name in metric_names:
+        data_vars[name] = (["time", "elev_bin", "aspect_bin"], metrics[name])
+
+    ds = xr.Dataset(
+        data_vars,
         coords={
-            "time": pss_binary["time"],
+            "time": model_data["time"],
             "elev_bin": np.arange(n_elev_bins),
             "aspect_bin": np.arange(n_aspect_bins),
-        },
-        name="recall",
+        }
     )
-    recall_ds = xr.Dataset({"recall": recall_da})
-    recall_ds["recall"].attrs["elev_bins"] = elev_bins
-    recall_ds["recall"].attrs["aspect_bins"] = aspect_bins
-    return recall_ds
+    ds.attrs["elev_bins"] = elev_bins.tolist()
+    ds.attrs["aspect_bins"] = aspect_bins.tolist()
+
+    return ds
 
 
-def build_or_load_model_grid(model, target_grid_da):
+def get_water_year(time_da, start_month=WATER_YEAR_START_MONTH):
     """
-    Build (or load from cache) the regridded model SCA stack for ONE model.
+    Assign a water year label to each timestamp.
+    Water year N runs from Oct 1 of year N-1 through Sep 30 of year N.
 
-    Returns an xr.DataArray "SCA" with dims (task, SWE_threshold_m, time, y, x),
-    stored as uint16 with NODATA_VAL as fill. One NetCDF file per model:
-    SCA_100m_gridded_{model}.nc
+    Parameters
+    ----------
+    time_da : xr.DataArray of datetime64
+    start_month : int
+        Calendar month (1-12) that begins the water year.
+
+    Returns
+    -------
+    xr.DataArray of int, same shape as time_da
     """
-    out_file = os.path.join(out_dir, f"SCA_100m_gridded_{model}.nc")
+    return xr.where(
+        time_da.dt.month >= start_month,
+        time_da.dt.year + 1,
+        time_da.dt.year,
+    )
 
-    if os.path.exists(out_file):
-        print(f"Regridded model grid exists, loading: {os.path.basename(out_file)}")
-        return xr.open_dataset(out_file)["SCA"]
 
-    print(f"Reprojecting all Task/SWE layers for model: {model}")
-    task_layers = []
-    for task in TASKS:
-        swe_layers = []
-        for swe_thresh in SWE_THRESHOLDS:
-            model_files = sorted(glob(os.path.join(
-                model_sca_dir, f"{model}*Task{task}*SWEthresh{swe_thresh}m.nc")))
-            if not model_files:
-                print(f"  No files for {model}, Task {task}, SWE {swe_thresh} m")
-                swe_layers.append(None)
-                continue
+def calculate_melt_out_doy(fsca_da, thresh=MELT_OUT_FSCA_THRESH):
+    """
+    Per-pixel melt-out day-of-water-year (DOWY) for a single water year of fSCA/SCA data.
 
-            mf = model_files[0]
-            with xr.open_dataset(mf) as model_ds_native:
-                model_sca_native = model_ds_native["SCA"].squeeze()
-                model_sca_native = xr.where(
-                    model_sca_native == NODATA_VAL, np.nan, model_sca_native)
-                model_sca_native = model_sca_native.rio.write_crs(CRS)
-                # Nearest neighbor for binary/categorical data
-                regrid = model_sca_native.rio.reproject_match(
-                    target_grid_da, resampling='nearest'
-                )
-            regrid = regrid.assign_coords(SWE_threshold_m=swe_thresh)
-            swe_layers.append(regrid)
+    Melt-out is defined as the LAST time step in the record at which a pixel is
+    snow covered (fsca >= thresh). Taking the last (not first) qualifying
+    observation means a spurious mid-winter dip below threshold (cloud gap,
+    brief melt/refreeze) does not get mistaken for melt-out, as long as the
+    pixel is observed snow-covered again later in the season.
 
-        # Reconcile any missing SWE layers by matching the shape of a present one
-        template = next((s for s in swe_layers if s is not None), None)
-        if template is None:
-            raise FileNotFoundError(f"No model files found at all for {model}, Task {task}")
-        swe_layers = [
-            s if s is not None
-            else xr.full_like(template, np.nan).assign_coords(SWE_threshold_m=swe)
-            for s, swe in zip(swe_layers, SWE_THRESHOLDS)
-        ]
-        task_stack = xr.concat(swe_layers, dim="SWE_threshold_m")
-        task_stack = task_stack.assign_coords(task=task)
-        task_layers.append(task_stack)
+    Parameters
+    ----------
+    fsca_da : xr.DataArray, dims (time, y, x)
+        fSCA or binary SCA for a SINGLE water year (time should already be
+        subset to one water year, e.g. via get_water_year + .sel/.where).
+    thresh : float
+        fSCA value at/above which a pixel counts as snow covered. Works for
+        both continuous fSCA (fine-res models, SPIReS) and binary SCA
+        (coarse-res models) as long as 0 < thresh < 1.
 
-    # Stack over task -> dims (task, SWE_threshold_m, time, y, x)
-    model_stack = xr.concat(task_layers, dim="task")
+    Returns
+    -------
+    xr.DataArray, dims (y, x)
+        Day-of-water-year (1 = start_month day 1) of the last snow-covered
+        observation. NaN where a pixel is never observed snow-covered that
+        water year, OR where it is still snow-covered at the final time step
+        of the record (melt-out unresolved/censored -- make sure the input
+        time series extends through the end of the ablation season).
+    """
+    is_snow = fsca_da >= thresh  # NaN treated as False (not a confirmed snow obs)
 
-    # Store as uint16 with NODATA fill
-    model_stack = xr.where(np.isnan(model_stack), NODATA_VAL, model_stack).astype(np.uint16)
-    model_stack.name = "SCA"
-    model_stack = model_stack.rio.write_crs(CRS)
-    model_stack = model_stack.rio.write_nodata(NODATA_VAL)
-    model_stack.attrs.update({
-        "long_name": f"Regridded model SCA grids ({model})",
-        "grid_resolution_m": TARGET_RES,
-        "nodata": NODATA_VAL,
-        "values": "0=no snow, 1=snow, 255=nodata",
+    dowy = xr.DataArray(
+        np.arange(1, fsca_da.sizes["time"] + 1),
+        dims="time",
+        coords={"time": fsca_da["time"]},
+    )
+
+    melt_out_dowy = dowy.where(is_snow).max(dim="time", skipna=True)
+
+    # Flag as unresolved (censored) if still snow-covered at the very last obs
+    still_snow_at_end = is_snow.isel(time=-1)
+    melt_out_dowy = melt_out_dowy.where(~still_snow_at_end)
+
+    return melt_out_dowy
+
+
+def calculate_melt_out_metrics(model_dowy, ref_dowy):
+    """
+    Pixel-wise melt-out date error metrics (in days) for one water year.
+
+    Parameters
+    ----------
+    model_dowy, ref_dowy : xr.DataArray, dims (y, x)
+        Melt-out day-of-water-year, e.g. from calculate_melt_out_doy. Should
+        already be restricted to the same set of valid pixels (see the
+        SPIReS-snow-covered masking applied in main()).
+
+    Returns
+    -------
+    xr.Dataset : scalar bias/MAE/RMSE (days, model - ref) and correlation
+    """
+    error = model_dowy - ref_dowy
+    valid = ~np.isnan(error)
+    n_pixels = int(valid.sum().item())
+
+    if n_pixels < 2:
+        bias = mae = rmse = corr = np.nan
+    else:
+        err_valid = error.values[valid.values]
+        bias = float(np.mean(err_valid))
+        mae = float(np.mean(np.abs(err_valid)))
+        rmse = float(np.sqrt(np.mean(err_valid**2)))
+        mod_valid = model_dowy.values[valid.values]
+        ref_valid = ref_dowy.values[valid.values]
+        if np.std(mod_valid) > 0 and np.std(ref_valid) > 0:
+            corr = float(np.corrcoef(mod_valid, ref_valid)[0, 1])
+        else:
+            corr = np.nan
+
+    return xr.Dataset({
+        "melt_out_bias_days": bias,
+        "melt_out_MAE_days": mae,
+        "melt_out_RMSE_days": rmse,
+        "melt_out_correlation": corr,
+        "melt_out_n_pixels": n_pixels,
     })
 
-    model_stack.to_dataset(name="SCA").to_netcdf(
-        out_file, encoding={"SCA": {"dtype": "uint16"}}
+
+def calculate_melt_out_metrics_binned(model_dowy, ref_dowy, elev_da, aspect_da, elev_bins, aspect_bins):
+    """
+    Elevation/aspect-binned melt-out date error metrics (in days) for one water year.
+
+    Unlike calculate_metrics_binned (fSCA), there's no time loop here -- melt-out
+    date is a single value per pixel per water year, not a time series.
+
+    Parameters
+    ----------
+    model_dowy, ref_dowy : xr.DataArray, dims (y, x)
+        Melt-out day-of-water-year, already restricted to the same valid pixels
+        (e.g. via the SPIReS-snow mask applied in main()).
+    elev_da, aspect_da : xr.DataArray, dims (y, x)
+        Elevation and aspect grids, same grid as model_dowy/ref_dowy.
+    elev_bins, aspect_bins : array-like
+        Bin edges.
+
+    Returns
+    -------
+    xr.Dataset with dims (elev_bin, aspect_bin): bias/MAE/RMSE (days, model - ref)
+    and pixel counts.
+    """
+    elev_bin_idx = np.digitize(elev_da.values, elev_bins) - 1
+    aspect_bin_idx = np.digitize(aspect_da.values, aspect_bins) - 1
+    n_elev_bins = len(elev_bins) - 1
+    n_aspect_bins = len(aspect_bins) - 1
+
+    metric_names = ["melt_out_bias_days", "melt_out_MAE_days", "melt_out_RMSE_days", "melt_out_n_pixels"]
+    metrics = {k: np.full((n_elev_bins, n_aspect_bins), np.nan) for k in metric_names}
+
+    mod = model_dowy.values
+    ref = ref_dowy.values
+
+    for j in range(n_elev_bins):
+        for k in range(n_aspect_bins):
+            bin_mask = (elev_bin_idx == j) & (aspect_bin_idx == k)
+            if not np.any(bin_mask):
+                continue
+
+            mod_bin = mod[bin_mask]
+            ref_bin = ref[bin_mask]
+            valid = ~np.isnan(mod_bin) & ~np.isnan(ref_bin)
+            mod_valid = mod_bin[valid]
+            ref_valid = ref_bin[valid]
+
+            if mod_valid.size == 0:
+                continue
+
+            diff = mod_valid - ref_valid
+            metrics["melt_out_bias_days"][j, k] = np.mean(diff)
+            metrics["melt_out_MAE_days"][j, k] = np.mean(np.abs(diff))
+            metrics["melt_out_RMSE_days"][j, k] = np.sqrt(np.mean(diff**2))
+            metrics["melt_out_n_pixels"][j, k] = mod_valid.size
+
+    data_vars = {name: (["elev_bin", "aspect_bin"], metrics[name]) for name in metric_names}
+    ds = xr.Dataset(
+        data_vars,
+        coords={"elev_bin": np.arange(n_elev_bins), "aspect_bin": np.arange(n_aspect_bins)},
     )
-    print(f"Saved regridded model grid: {os.path.basename(out_file)}")
-    return model_stack
+    return ds
 
 
 # ----- MAIN WORKFLOW -----
 def main():
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
 
-    # --- Calculate PlanetScope areas time series at native grid ---
-    if os.path.exists(PSS_TOTALS_NATIVE_FILE):
-        print(f"PlanetScope native-grid areas exist, loading: {PSS_TOTALS_NATIVE_FILE}")
-        sca_pss_native_df = pd.read_csv(PSS_TOTALS_NATIVE_FILE)
-    else:
-        print("Calculating PlanetScope areas time series at native grid...")
-        sca_pss_native_list = []
-        for pss_sca_file in tqdm(pss_sca_files):
-            with rxr.open_rasterio(pss_sca_file, masked=False, chunks=CHUNKS).squeeze() as da:
-                da = da.rio.write_crs(CRS)
-                res = da.rio.resolution()
-                pixel_area_native = abs(res[0] * res[1])
-                snow_area = float(xr.where(da == SNOW_VAL, 1, 0).sum().data) * pixel_area_native
-                nosnow_area = float(xr.where(da == NOSNOW_VAL, 1, 0).sum().data) * pixel_area_native
-                tree_area = float(xr.where(da == TREE_VAL, 1, 0).sum().data) * pixel_area_native
-                nodata_area = float(xr.where(da == NODATA_VAL, 1, 0).sum().data) * pixel_area_native
-            df = pd.DataFrame({
-                "datetime": [os.path.basename(pss_sca_file).split("_")[0]],
-                "SCA_PSS-native-grid_m2": [snow_area],
-                "nosnow_area_PSS-native-grid_m2": [nosnow_area],
-                "tree_area_PSS-native-grid_m2": [tree_area],
-                "nodata_area_PSS-native-grid_m2": [nodata_area],
-            }, index=[0])
-            sca_pss_native_list += [df]
-        sca_pss_native_df = pd.concat(sca_pss_native_list, ignore_index=True)
-        sca_pss_native_df.to_csv(PSS_TOTALS_NATIVE_FILE, index=False, header=True)
-        print(f"Saved to: {PSS_TOTALS_NATIVE_FILE}")
+    # --- Load and preprocess SPIReS fSCA ---
+    print("Loading and preparing SPIReS fSCA...")
+    spires_ds = xr.open_dataset(SPIRES_FSCA_FILE, mask_and_scale=False)
+    spires_fsca_raw = spires_ds["snow_fraction"]
+    spires_fsca = spires_fsca_raw.where(spires_fsca_raw != NODATA_VAL) / 100.0
+    spires_fsca = spires_fsca.rio.write_crs(CRS)
+    n_time = len(spires_fsca.time.data)
+    aoi = gpd.read_file(AOI_FILE)
 
-    # --- Create a new 100 m grid ---
-    print("Creating new 100 m grid for comparisons")
-    target_grid_file = os.path.join(out_dir, "target_grid.tif")
-    if not os.path.exists(target_grid_file):
-        # Load AOI
-        aoi = gpd.read_file(aoi_file)
-        aoi = aoi.to_crs(CRS)
-
-        # Create "nice" grid with round numbers
-        xmin, ymin, xmax, ymax = aoi.geometry.bounds.values[0]
-        xmin_round = np.floor(xmin / TARGET_RES) * TARGET_RES
-        xmax_round = np.ceil(xmax / TARGET_RES) * TARGET_RES
-        ymin_round = np.floor(ymin / TARGET_RES) * TARGET_RES
-        ymax_round = np.ceil(ymax / TARGET_RES) * TARGET_RES
-        target_x = np.arange(xmin_round, xmax_round + TARGET_RES, TARGET_RES)
-        target_y = np.arange(ymax_round, ymin_round - TARGET_RES, -TARGET_RES)  # Top-down for Y
-
-        # Create dummy data array for reprojecting rasters
-        target_grid_da = xr.DataArray(
-            data=np.ones((len(target_y), len(target_x))),
-            dims=["y", "x"],
-            coords={"y": target_y, "x": target_x},
-        ).rio.write_crs(CRS)
-        target_grid_da = target_grid_da.rio.clip(
-            geometries=aoi.geometry,
-            crs=CRS,
-            drop=False,
-            all_touched=True
-        )
-        pixel_area = TARGET_RES ** 2
-
-        # Save to file
-        target_grid_da.rio.to_raster(target_grid_file)
-        print("Target grid saved to:", target_grid_file)
-    else:
-        print("Target grid file already exists, loading.")
-        target_grid_da = rxr.open_rasterio(target_grid_file, masked=True).squeeze()
-        pixel_area = TARGET_RES ** 2
-
-    # --- Calculate PlanetScope fractional areas at target grid ---
-    if not os.path.exists(PSS_FSCA_REGRID_FILE):
-        print("Regridding PlanetScope fSCA to target grid")
-        pss_fsca_regrid = load_and_reproject_pss_sca(
-            pss_sca_files, target_grid_da, PSS_FSCA_REGRID_FILE, chunks=CHUNKS
-        )
-    else:
-        print("Regridded PlanetScope FSCA exist, skipping.")
-        pss_fsca_regrid = xr.open_dataset(PSS_FSCA_REGRID_FILE)
-
-    # --- Comparison mask ---
-    comp_mask_ts = build_comparison_mask(
-        pss_fsca_regrid["tree_frac"], pss_fsca_regrid["certain_frac"], pss_fsca_regrid["valid_frac"]
-    )
-
-    time_coord = pss_fsca_regrid["time"]
-    n_time = pss_fsca_regrid.sizes["time"]
-
-    # -----------------------------------------------------------------
-    # PlanetScope SCA totals + uncertainty
-    # -----------------------------------------------------------------
-    if os.path.exists(PSS_TOTALS_REGRID_FILE):
-        print(f"PlanetScope SCA totals exist, loading: {PSS_TOTALS_REGRID_FILE}")
-    else:
-        print("Calculating PlanetScope SCA totals and uncertain-area totals (target grid)...")
-        keys = [
-            "SCA_m2", "SCA_lower_m2", "SCA_upper_m2", 
-            "uncertain_area_m2", "certain_area_m2", "valid_area_m2"
-            ]
-        pss_totals = {k: np.full(n_time, np.nan, dtype="float64") for k in keys}
-        for i in tqdm(range(n_time)):
-            comp_mask_i = comp_mask_ts.isel(time=i)
-            res = calculate_planetscope_sca(
-                pss_fsca_regrid["snow_frac"].isel(time=i),
-                pss_fsca_regrid["certain_frac"].isel(time=i),
-                pss_fsca_regrid["valid_frac"].isel(time=i),
-                comp_mask_i,
-                pixel_area,
-            )
-            for k in keys:
-                pss_totals[k][i] = res[k]
-
-        pss_totals_ds = xr.Dataset(
-            {k: ("time", pss_totals[k]) for k in keys},
-            coords={"time": time_coord.values},
-        )
-        pss_totals_ds["SCA_m2"].attrs.update({
-            "long_name": "PlanetScope snow-covered area within comparison mask",
-            "units": "m2",
-        })
-        pss_totals_ds["SCA_lower_m2"].attrs.update({
-            "long_name": "Lower bound: uncertain (tree/unclassified) area treated as no-snow",
-            "units": "m2",
-        })
-        pss_totals_ds["SCA_upper_m2"].attrs.update({
-            "long_name": "Upper bound: uncertain (tree/unclassified) area treated as snow",
-            "units": "m2",
-        })
-        pss_totals_ds["uncertain_area_m2"].attrs.update({
-            "long_name": "Area of uncertain snow status (trees + unclassified/edge) within mask",
-            "units": "m2",
-        })
-        pss_totals_ds.attrs.update({
-            "long_name": "PlanetScope SCA totals with uncertainty bounds",
-            "grid_resolution_m": TARGET_RES,
-            "uncertainty_definition": (
-                "Bounds bracket the best estimate by assigning the uncertain "
-                "area (1 - certain_frac) entirely to no-snow (lower) or snow (upper)."
-            ),
-        })
-        pss_totals_ds.to_netcdf(PSS_TOTALS_REGRID_FILE)
-        print("Saved:", PSS_TOTALS_REGRID_FILE)
-
-    # --- Elevation and aspect bins ---
-    print("Calculating elevation and aspect bins from native DEM")
-    with rxr.open_rasterio(dem_file, masked=True).squeeze() as dem_da:
-        dem_regrid = dem_da.rio.reproject_match(target_grid_da, resampling='bilinear')
+    # --- Load terrain data ---
+    print("Loading and reprojecting DEM for terrain analysis...")
+    with rxr.open_rasterio(DEM_FILE, masked=True).squeeze() as dem_da:
+        dem_regrid = dem_da.rio.reproject_match(spires_fsca, resampling='bilinear')
+        dem_regrid = dem_regrid.rio.clip(aoi.geometry)
     aspect_regrid = xrspatial.aspect(dem_regrid)
-    elev_bins = get_elev_bins(dem_regrid, bin_width=50)
+    elev_bins = get_elev_bins(dem_regrid, bin_width=100)
     aspect_bins = np.arange(0, 361, 45)
 
-    # -----------------------------------------------------------------
-    # Accumulators for the consolidated outputs
-    # -----------------------------------------------------------------
-    sca_modeled = {} 
-    cm_accum = {"TP": {}, "TN": {}, "FP": {}, "FN": {}}
-    recall_accum = {}
-    recall_elev_bins = elev_bins
-    recall_aspect_bins = aspect_bins
+    # Metrics for all models
+    all_metrics = {
+        "RMSE": {}, "MAE": {}, "correlation": {}, "bias": {}, "fSCA_average_error": {}, "partial_credit_error": {}
+    }
+    binned_metrics = {}
 
-    # Iterate MODEL -> TASK -> SWE so each model's grid file is built once
-    for model in model_names:
-        print(f"\n{'='*60}\nProcessing model: {model}\n{'='*60}")
+    # --- Precompute SPIReS melt-out dates per water year (used to mask all models) ---
+    print("Calculating SPIReS melt-out dates by water year...")
+    water_year = get_water_year(spires_fsca["time"])
+    spires_fsca = spires_fsca.assign_coords(water_year=("time", water_year.data))
+    water_years = np.unique(water_year.data)
 
-        # Build or load the single per-model regridded dataset
-        model_grid = build_or_load_model_grid(model, target_grid_da)  # (task, SWE, time, y, x)
+    spires_melt_out_by_wy = {}   # wy -> (y, x) DataArray of SPIReS melt-out DOWY
+    spires_snow_mask_by_wy = {}  # wy -> (y, x) boolean, True where SPIReS ever saw snow that WY
+    for wy in water_years:
+        spires_wy = spires_fsca.sel(time=spires_fsca["water_year"] == wy)
+        wy_doy = calculate_melt_out_doy(spires_wy, thresh=MELT_OUT_FSCA_THRESH)
+        spires_melt_out_by_wy[wy] = wy_doy
+        spires_snow_mask_by_wy[wy] = wy_doy.notnull()
 
-        for task in TASKS:
-            print(f"\n  Task {task}")
-            for swe_thresh in tqdm(SWE_THRESHOLDS):
-                try:
-                    layer = model_grid.sel(task=task, SWE_threshold_m=swe_thresh)
-                except KeyError:
-                    print(f"  Missing layer for {model}, Task {task}, SWE {swe_thresh} m")
-                    continue
+    melt_out_metrics = {}  # (model, task, swe_thresh, wy) -> xr.Dataset of scalar metrics
+    melt_out_grids = {}    # (model, task, swe_thresh, wy) -> (y, x) DataArray of model melt-out DOWY
+    melt_out_binned = {}   # (model, task, swe_thresh, wy) -> xr.Dataset binned by elevation/aspect
 
-                model_da = xr.where(layer == NODATA_VAL, np.nan, layer)
-                model_da = model_da.rio.write_crs(CRS)
+    # --- Process each model ---
+    print("Processing each model...")
+    for model in MODEL_NAMES:
+        model_matched_file = os.path.join(OUT_DIR, f"fSCA_regridded_{model}.nc")
 
-                # Match model timestamps to PlanetScope timestamps
-                model_matched = model_da.reindex(
-                    time=pss_fsca_regrid["time"], method="nearest", tolerance=TIME_TOL
-                )
+        if os.path.exists(model_matched_file):
+            print(f"Loading resampled fSCA for {model} from file...")
+            combined_fsca = xr.open_dataset(model_matched_file)
+        else:
+            print(f"Creating resampled fSCA file for {model}...")
+            all_model_fsca = []
+            for task in TASKS:
+                for swe_thresh in tqdm(SWE_THRESHOLDS, desc=f"{model} Task {task}"):
+                    model_file = os.path.join(
+                        MODEL_SCA_DIR,
+                        f"{model}_SCA_timeseries_Task{task}_SWEthresh{swe_thresh}m.nc"
+                    )
+                    if not os.path.exists(model_file):
+                        print(f"File not found, skipping: {model_file}")
+                        continue
+                    
+                    with xr.open_dataset(model_file, mask_and_scale=True) as model_ds:
+                        model_ds = xr.where(model_ds == 255, np.nan, model_ds)
+                        model_matched = model_ds['SCA'].reindex(
+                            time=spires_fsca['time'], method='nearest', tolerance=TIME_TOL
+                        )
+                        model_matched = xr.where(model_matched == NODATA_VAL, np.nan, model_matched).rio.write_crs(CRS)
+                    
+                    resample_method = 'average' if model in FINE_RES_MODELS else 'nearest'
+                    model_fsca_da = model_matched.rio.reproject_match(
+                        spires_fsca, resampling=resample_method
+                    )
+                    if model in FINE_RES_MODELS:
+                        model_fsca_da = model_fsca_da.clip(0, 1)
+                    
+                    model_fsca_da = model_fsca_da.rio.clip(aoi.geometry)
+                    model_fsca_da.name = "fSCA"
+                    model_fsca_da = model_fsca_da.expand_dims(
+                        {'task': [task], 'SWE_threshold_m': [swe_thresh]}
+                    )
+                    all_model_fsca.append(model_fsca_da)
 
+            if not all_model_fsca:
+                print(f"No data processed for model {model}, skipping.")
+                continue
+
+            combined_fsca = xr.combine_by_coords(all_model_fsca)
+            combined_fsca.to_netcdf(model_matched_file)
+            print("Resampled model fSCA saved to:", model_matched_file)
+
+        # combined_fsca['time'] == spires_fsca['time'] (reindexed to it above), so the
+        # water years computed from spires_fsca line up directly
+        combined_fsca = combined_fsca.assign_coords(water_year=("time", water_year.data))
+
+        # Now iterate through the combined data to calculate metrics
+        for task in combined_fsca.task.values:
+            for swe_thresh in combined_fsca.SWE_threshold_m.values:
+                model_fsca = combined_fsca['fSCA'].sel(task=task, SWE_threshold_m=swe_thresh)
                 key = (model, task, swe_thresh)
 
-                # ----- SCA totals -----
-                sca_arr = np.full(n_time, np.nan, dtype="float64")
-                for i in range(n_time):
-                    comp_mask_i = comp_mask_ts.isel(time=i)
-                    m_i = model_matched.isel(time=i)
-                    mod_snow, _mod_valid = calculate_model_sca(m_i, comp_mask_i, pixel_area)
-                    sca_arr[i] = round(mod_snow)
-                sca_modeled[key] = sca_arr
+                if model in FINE_RES_MODELS:
+                    metrics_ds = calculate_fsca_metrics(model_fsca, spires_fsca)
+                    for metric_name in metrics_ds.data_vars:
+                         if metric_name in all_metrics:
+                            all_metrics[metric_name][key] = metrics_ds[metric_name].values
+                    binned_ds = calculate_metrics_binned(
+                        model_fsca, spires_fsca, dem_regrid, aspect_regrid,
+                        elev_bins, aspect_bins, is_binary=False
+                    )
+                    binned_metrics[key] = binned_ds
+                else:
+                    scores_ds = calculate_partial_credit_error(model_fsca, spires_fsca)
+                    all_metrics["partial_credit_error"][key] = scores_ds['partial_credit_error'].values
+                    binned_ds = calculate_metrics_binned(
+                        model_fsca, spires_fsca, dem_regrid, aspect_regrid,
+                        elev_bins, aspect_bins, is_binary=True
+                    )
+                    binned_metrics[key] = binned_ds
 
-                # ----- Confusion matrix -----
-                tp_arr = np.full(n_time, np.nan, dtype="float64")
-                tn_arr = np.full(n_time, np.nan, dtype="float64")
-                fp_arr = np.full(n_time, np.nan, dtype="float64")
-                fn_arr = np.full(n_time, np.nan, dtype="float64")
-                for i in range(n_time):
-                    comp_mask_i = comp_mask_ts.isel(time=i)
-                    fsca_i = pss_fsca_regrid["fsca"].isel(time=i)
-                    model_i = model_matched.isel(time=i)
+        # --- Melt-out date comparison, masked to pixels SPIReS observed as snow-covered ---
+        for wy in water_years:
+            spires_snow_mask = spires_snow_mask_by_wy[wy]
+            ref_dowy = spires_melt_out_by_wy[wy].where(spires_snow_mask)
+            combined_fsca_wy = combined_fsca.sel(time=combined_fsca["water_year"] == wy)
 
-                    mod_bin = xr.where(np.isnan(model_i), np.nan, xr.where(model_i == 1, 1.0, 0.0))
-                    pss_bin = xr.where(np.isnan(fsca_i), np.nan,
-                                       xr.where(fsca_i >= FSCA_THRESHOLD, 1.0, 0.0))
-                    cm = calculate_confusion_matrix(mod_bin, pss_bin, comp_mask_i)
-                    tp_arr[i] = cm["TP"]
-                    tn_arr[i] = cm["TN"]
-                    fp_arr[i] = cm["FP"]
-                    fn_arr[i] = cm["FN"]
-                cm_accum["TP"][key] = tp_arr
-                cm_accum["TN"][key] = tn_arr
-                cm_accum["FP"][key] = fp_arr
-                cm_accum["FN"][key] = fn_arr
+            if combined_fsca_wy.sizes["time"] == 0:
+                continue
 
-                # ----- Elevation/aspect binned recall -----
-                pss_bin_all = xr.where(
-                    np.isnan(pss_fsca_regrid["fsca"]), np.nan,
-                    xr.where(pss_fsca_regrid["fsca"] >= FSCA_THRESHOLD, 1.0, 0.0)
-                )
-                mod_bin_all = xr.where(
-                    np.isnan(model_matched), np.nan, xr.where(model_matched == 1, 1.0, 0.0)
-                )
-                recall_terrain_ds = calculate_recall_with_terrain(
-                    pss_bin_all, mod_bin_all, dem_regrid, aspect_regrid,
-                    elev_bins, aspect_bins, comp_mask_ts
-                )
-                recall_accum[key] = recall_terrain_ds["recall"].values
+            for task in combined_fsca_wy.task.values:
+                for swe_thresh in combined_fsca_wy.SWE_threshold_m.values:
+                    model_fsca_wy = combined_fsca_wy["fSCA"].sel(task=task, SWE_threshold_m=swe_thresh)
 
-    # ----- Build coordinate arrays for the consolidated files -----
-    models_coord = list(model_names)
-    tasks_coord = list(TASKS)
-    swe_coord = list(SWE_THRESHOLDS)
-    n_model = len(models_coord)
-    n_task = len(tasks_coord)
-    n_swe = len(swe_coord)
+                    # Restrict to pixels SPIReS observed as snow-covered this water year
+                    # (this is what excludes canopy-obscured / never-snow-per-SPIReS pixels)
+                    model_fsca_masked = model_fsca_wy.where(spires_snow_mask)
+                    model_dowy = calculate_melt_out_doy(model_fsca_masked, thresh=MELT_OUT_FSCA_THRESH)
 
-    # ----- Save output files -----
-    # Modeled SCA totals
-    print("\nWriting compiled modeled SCA totals...")
-    sca_data = np.full((n_model, n_task, n_swe, n_time), np.nan, dtype="float64")
-    for (model, task, swe), arr in sca_modeled.items():
-        mi = models_coord.index(model)
-        ti = tasks_coord.index(task)
-        si = swe_coord.index(swe)
-        sca_data[mi, ti, si, :] = arr
+                    key = (model, task, swe_thresh, wy)
+                    melt_out_metrics[key] = calculate_melt_out_metrics(model_dowy, ref_dowy)
+                    melt_out_binned[key] = calculate_melt_out_metrics_binned(
+                        model_dowy, ref_dowy, dem_regrid, aspect_regrid, elev_bins, aspect_bins
+                    )
+                    if SAVE_MELT_OUT_GRIDS:
+                        melt_out_grids[key] = model_dowy
 
-    sca_ds = xr.Dataset(
-        {"SCA": (["model", "task", "SWE_threshold_m", "time"], sca_data)},
+    # --- Save outputs ---
+    print("\nSaving performance metrics...")
+
+    # Compiled performance metrics
+    metric_names = list(all_metrics.keys())
+    metrics_data = {}
+    for metric in metric_names:
+        # Check if the metric has any calculated values
+        if not all_metrics[metric]:
+            continue
+        data = np.full((len(MODEL_NAMES), len(TASKS), len(SWE_THRESHOLDS), n_time), np.nan)
+        for (model, task, swe), arr in all_metrics[metric].items():
+            mi = MODEL_NAMES.index(model)
+            ti = TASKS.index(task)
+            si = SWE_THRESHOLDS.index(swe)
+            # Ensure the array slice is compatible
+            if arr.ndim == 1 and arr.shape[0] == n_time:
+                data[mi, ti, si, :] = arr
+        metrics_data[metric] = (["model", "task", "SWE_threshold_m", "time"], data)
+
+    metrics_ds = xr.Dataset(
+        metrics_data,
         coords={
-            "model": models_coord,
-            "task": tasks_coord,
-            "SWE_threshold_m": swe_coord,
-            "time": time_coord.values,
-        },
+            "model": MODEL_NAMES,
+            "task": TASKS,
+            "SWE_threshold_m": SWE_THRESHOLDS,
+            "time": spires_fsca.time.data,
+        }
     )
-    sca_ds["SCA"].attrs.update({
-        "long_name": "Modeled snow-covered area within comparison mask",
-        "units": "m2",
-        "grid_resolution_m": TARGET_RES,
-        "fsca_threshold": FSCA_THRESHOLD,
-        "error_bar_note": "Model spread across SWE_threshold_m gives the model error bars.",
+    metrics_ds.attrs.update({
+        "description": "Performance metrics for all models vs. SPIReS fSCA.",
+        "note_fine": "Fine-res models (RMSE, MAE, correlation are valid). Errors are on a 0-100 scale.",
+        "note_coarse": "Coarse-res models (partial_credit_error is valid). Error is on a 0-100 scale.",
     })
-    sca_ds.to_netcdf(SCA_MODELED_FILE)
-    print("Saved:", SCA_MODELED_FILE)
+    metrics_ds.to_netcdf(METRICS_FILE)
+    print("Compiled performance metrics saved to:", METRICS_FILE)
 
-    # Confusion matrices
-    print("Writing compiled confusion matrices...")
-    cm_vars = {}
-    for name in ("TP", "TN", "FP", "FN"):
-        data = np.full((n_model, n_task, n_swe, n_time), np.nan, dtype="float64")
-        for (model, task, swe), arr in cm_accum[name].items():
-            mi = models_coord.index(model)
-            ti = tasks_coord.index(task)
-            si = swe_coord.index(swe)
-            data[mi, ti, si, :] = arr
-        cm_vars[name] = (["model", "task", "SWE_threshold_m", "time"], data)
+    # Terrain-binned metrics
+    n_elev = len(elev_bins) - 1
+    n_aspect = len(aspect_bins) - 1
+    binned_data = {}
+    all_binned_metric_names = {"RMSE", "MAE", "correlation", "partial_credit_error", "n_pixels"}
 
-    cm_ds = xr.Dataset(
-        cm_vars,
+    for metric in all_binned_metric_names:
+        # Check if any binned data exists for this metric
+        has_metric = any(metric in ds for ds in binned_metrics.values())
+        if not has_metric:
+            continue
+            
+        data = np.full((len(MODEL_NAMES), len(TASKS), len(SWE_THRESHOLDS), n_time, n_elev, n_aspect), np.nan)
+        for (model, task, swe), ds in binned_metrics.items():
+            mi = MODEL_NAMES.index(model)
+            ti = TASKS.index(task)
+            si = SWE_THRESHOLDS.index(swe)
+            if metric in ds:
+                data[mi, ti, si, :, :, :] = ds[metric].values
+        binned_data[metric] = (
+            ["model", "task", "SWE_threshold_m", "time", "elev_bin", "aspect_bin"], data
+        )
+
+    binned_ds = xr.Dataset(
+        binned_data,
         coords={
-            "model": models_coord,
-            "task": tasks_coord,
-            "SWE_threshold_m": swe_coord,
-            "time": time_coord.values,
-        },
+            "model": MODEL_NAMES,
+            "task": TASKS,
+            "SWE_threshold_m": SWE_THRESHOLDS,
+            "time": spires_fsca.time.data,
+            "elev_bin": np.arange(n_elev),
+            "aspect_bin": np.arange(n_aspect),
+        }
     )
-    cm_ds.attrs.update({
-        "long_name": "Confusion matrix counts (model vs. PlanetScope fSCA)",
-        "fsca_threshold": FSCA_THRESHOLD,
-        "grid_resolution_m": TARGET_RES,
-        "definition": "TP/TN/FP/FN of binary model SCA vs. binary PlanetScope fSCA within comparison mask",
+    binned_ds.attrs.update({
+        "description": "Performance metrics binned by elevation and aspect.",
+        "elev_bins": elev_bins.tolist(),
+        "aspect_bins": aspect_bins.tolist(),
     })
-    cm_ds.to_netcdf(CM_FILE)
-    print("Saved:", CM_FILE)
+    binned_ds.to_netcdf(BINNED_METRICS_FILE)
+    print("Performance metrics binned by terrain saved to:", BINNED_METRICS_FILE)
 
-    # Recall with terrain
-    print("Writing compiled recall with terrain...")
-    n_elev_bins = len(recall_elev_bins) - 1
-    n_aspect_bins = len(recall_aspect_bins) - 1
-    recall_data = np.full(
-        (n_model, n_task, n_swe, n_time, n_elev_bins, n_aspect_bins),
-        np.nan, dtype="float64"
-    )
-    for (model, task, swe), arr in recall_accum.items():
-        mi = models_coord.index(model)
-        ti = tasks_coord.index(task)
-        si = swe_coord.index(swe)
-        recall_data[mi, ti, si, :, :, :] = arr
+    # --- Save melt-out date outputs ---
+    print("\nSaving melt-out date metrics...")
 
-    recall_ds = xr.Dataset(
-        {"recall": (
-            ["model", "task", "SWE_threshold_m", "time", "elev_bin", "aspect_bin"],
-            recall_data
-        )},
+    melt_out_metric_names = [
+        "melt_out_bias_days", "melt_out_MAE_days", "melt_out_RMSE_days",
+        "melt_out_correlation", "melt_out_n_pixels",
+    ]
+    melt_out_data = {}
+    for metric in melt_out_metric_names:
+        data = np.full(
+            (len(MODEL_NAMES), len(TASKS), len(SWE_THRESHOLDS), len(water_years)), np.nan
+        )
+        for (model, task, swe, wy), ds in melt_out_metrics.items():
+            mi = MODEL_NAMES.index(model)
+            ti = TASKS.index(task)
+            si = SWE_THRESHOLDS.index(swe)
+            wi = list(water_years).index(wy)
+            data[mi, ti, si, wi] = ds[metric].item()
+        melt_out_data[metric] = (["model", "task", "SWE_threshold_m", "water_year"], data)
+
+    melt_out_metrics_ds = xr.Dataset(
+        melt_out_data,
         coords={
-            "model": models_coord,
-            "task": tasks_coord,
-            "SWE_threshold_m": swe_coord,
-            "time": time_coord.values,
-            "elev_bin": np.arange(n_elev_bins),
-            "aspect_bin": np.arange(n_aspect_bins),
+            "model": MODEL_NAMES,
+            "task": TASKS,
+            "SWE_threshold_m": SWE_THRESHOLDS,
+            "water_year": water_years,
         },
     )
-    recall_ds["recall"].attrs["elev_bins"] = recall_elev_bins
-    recall_ds["recall"].attrs["aspect_bins"] = recall_aspect_bins
-    recall_ds["recall"].attrs["fsca_threshold"] = FSCA_THRESHOLD
-    recall_ds["recall"].attrs["long_name"] = "Recall (model vs. PlanetScope) binned by elevation and aspect"
-    recall_ds.to_netcdf(RECALL_FILE)
-    print("Saved:", RECALL_FILE)
+    melt_out_metrics_ds.attrs.update({
+        "description": (
+            "Melt-out date comparison metrics (model - SPIReS), in days. "
+            "Computed only at pixels where SPIReS observed snow cover "
+            f"(fSCA >= {MELT_OUT_FSCA_THRESH}) during that water year, to keep "
+            "canopy-obscured SPIReS pixels from biasing the comparison."
+        ),
+        "melt_out_fsca_thresh": MELT_OUT_FSCA_THRESH,
+        "water_year_start_month": WATER_YEAR_START_MONTH,
+    })
+    melt_out_metrics_ds.to_netcdf(MELT_OUT_METRICS_FILE)
+    print("Melt-out date metrics saved to:", MELT_OUT_METRICS_FILE)
 
-    print("\nDone! :3")
+    # --- Save melt-out terrain-binned metrics (elevation/aspect) ---
+    print("Saving melt-out terrain-binned metrics...")
+    melt_out_binned_names = ["melt_out_bias_days", "melt_out_MAE_days", "melt_out_RMSE_days", "melt_out_n_pixels"]
+    melt_out_binned_data = {}
+    for metric in melt_out_binned_names:
+        data = np.full(
+            (len(MODEL_NAMES), len(TASKS), len(SWE_THRESHOLDS), len(water_years), n_elev, n_aspect), np.nan
+        )
+        for (model, task, swe, wy), ds in melt_out_binned.items():
+            mi = MODEL_NAMES.index(model)
+            ti = TASKS.index(task)
+            si = SWE_THRESHOLDS.index(swe)
+            wi = list(water_years).index(wy)
+            if metric in ds:
+                data[mi, ti, si, wi, :, :] = ds[metric].values
+        melt_out_binned_data[metric] = (
+            ["model", "task", "SWE_threshold_m", "water_year", "elev_bin", "aspect_bin"], data
+        )
+
+    melt_out_binned_ds = xr.Dataset(
+        melt_out_binned_data,
+        coords={
+            "model": MODEL_NAMES,
+            "task": TASKS,
+            "SWE_threshold_m": SWE_THRESHOLDS,
+            "water_year": water_years,
+            "elev_bin": np.arange(n_elev),
+            "aspect_bin": np.arange(n_aspect),
+        },
+    )
+    melt_out_binned_ds.attrs.update({
+        "description": "Melt-out date errors (model - SPIReS, days) binned by elevation and aspect.",
+        "elev_bins": elev_bins.tolist(),
+        "aspect_bins": aspect_bins.tolist(),
+        "melt_out_fsca_thresh": MELT_OUT_FSCA_THRESH,
+    })
+    melt_out_binned_ds.to_netcdf(MELT_OUT_BINNED_FILE)
+    print("Melt-out terrain-binned metrics saved to:", MELT_OUT_BINNED_FILE)
+
+    if SAVE_MELT_OUT_GRIDS:
+        print("Saving gridded melt-out dates...")
+        y_coord, x_coord = spires_fsca["y"], spires_fsca["x"]
+        model_grid_data = np.full(
+            (len(MODEL_NAMES), len(TASKS), len(SWE_THRESHOLDS), len(water_years),
+             y_coord.size, x_coord.size), np.nan
+        )
+        for (model, task, swe, wy), doy_da in melt_out_grids.items():
+            mi = MODEL_NAMES.index(model)
+            ti = TASKS.index(task)
+            si = SWE_THRESHOLDS.index(swe)
+            wi = list(water_years).index(wy)
+            model_grid_data[mi, ti, si, wi, :, :] = doy_da.values
+
+        spires_grid_data = np.stack(
+            [spires_melt_out_by_wy[wy].where(spires_snow_mask_by_wy[wy]).values for wy in water_years],
+            axis=0,
+        )
+
+        melt_out_grids_ds = xr.Dataset(
+            {
+                "model_melt_out_dowy": (
+                    ["model", "task", "SWE_threshold_m", "water_year", "y", "x"],
+                    model_grid_data,
+                ),
+                "SPIReS_melt_out_dowy": (["water_year", "y", "x"], spires_grid_data),
+            },
+            coords={
+                "model": MODEL_NAMES,
+                "task": TASKS,
+                "SWE_threshold_m": SWE_THRESHOLDS,
+                "water_year": water_years,
+                "y": y_coord,
+                "x": x_coord,
+            },
+        )
+        melt_out_grids_ds.attrs.update({
+            "description": (
+                "Per-pixel melt-out day-of-water-year (DOWY; 1 = Oct 1), masked to "
+                "pixels SPIReS observed as snow-covered that water year."
+            ),
+            "melt_out_fsca_thresh": MELT_OUT_FSCA_THRESH,
+        })
+        melt_out_grids_ds.rio.write_crs(CRS).to_netcdf(MELT_OUT_GRIDS_FILE)
+        print("Gridded melt-out dates saved to:", MELT_OUT_GRIDS_FILE)
+
+    print("\nDone!")
 
 
 if __name__ == "__main__":

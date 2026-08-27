@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
-# Script to download SnowToday files on the FTP server
-# Adapted from the NSIDC example
+# Script to download SPIReS-MODIS/Terra fSCA files from SnowToday on the FTP server
+# Adapted from the NSIDC example: https://nsidc.org/data/user-resources/help-center/how-access-nsidc-data-using-ftp-client-command-line-wget-or-python
 
 # NOTE: SPIRES CRS = ESRI:54008
 
@@ -18,6 +18,9 @@ DATA_DIRS = [
     '/shares/snow-today/gridded_data/SPIRES_HIST_V01/h09v04/2024',
     '/shares/snow-today/gridded_data/SPIRES_HIST_V01/h09v04/2025'
 ]
+
+MONTH_START = 10    # inclusive
+MONTH_END = 6       # inclusive
 
 # FTP server
 ftpdir = 'dtn.rc.colorado.edu'
@@ -40,11 +43,11 @@ for data_dir in DATA_DIRS:
     # Get a list of the files in the FTP directory
     files = ftp.nlst()
 
-    # Only need 1-Oct through 30-June
+    # Filter by month
     dates = [x.split('_')[4] for x in files]
     dts = np.array([np.datetime64(f"{x[0:4]}-{x[4:6]}-{x[6:]}") for x in dates])
     months = dts.astype('datetime64[M]').astype(int) % 12 + 1
-    ikeep = [i for i in range(len(months)) if (months[i] >= 10) or (months[i] <= 6)]
+    ikeep = [i for i in range(len(months)) if (months[i] >= MONTH_START) or (months[i] <= MONTH_END)]
     files_filt = [files[i] for i in ikeep]
 
     # Download all the files within the FTP directory
