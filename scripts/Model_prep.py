@@ -17,8 +17,9 @@ from rasterio.warp import reproject, Resampling
 
 # This script can be stored within the date parent directory (ie. "/20240405")
 ## Note: task number must be changed to process task 1 or task 2 outputs
-dir = "."
-Task_number = 2
+# dir = "."
+dir = "/Users/rdcrlrka/Research/SIRO/MCSModeling/SIRO_P1/dates/20230405"
+Task_number = 1
 
 if Task_number == 1:
     modeled = os.path.join(dir, "modeled/Task1")
@@ -36,7 +37,7 @@ figs_dir = os.path.join(out_dir, "figs/")
 
 #call lidar datasets. Two LiDAR datasets exits: one is 2-km scale, the other is 100-m. HMS outputs will be reresampled to 2-km products.
 lidar = glob.glob(os.path.join(dir, "lidar","*SD.tif"))
-lidar_2000 = glob.glob(os.path.join(dir, "lidar","*2000*"))
+lidar_2000 = glob.glob(os.path.join(dir, "lidar","*2000*.tif"))
 if not lidar:
     raise FileNotFoundError("No SD lidar raster found")
 
@@ -164,7 +165,7 @@ for model, raster_list in rasters.items():
     else:
         for raster in raster_list:
             with rasterio.open(raster) as src:
-                out_image, out_transform = rasterio.mask.mask(src, shapes, crop=True)
+                out_image, out_transform = rasterio.mask.mask(src, shapes, crop=True, all_touched=True)
 # Copy the old profile and update it with new metadata
                 profile = src.profile
                 profile.update({
@@ -342,7 +343,7 @@ for model, raster_list in rasters.items():
             
         else:
             with rasterio.open(raster) as src:
-                out_image, out_transform = rasterio.mask.mask(src, shapes, crop=True)
+                out_image, out_transform = rasterio.mask.mask(src, shapes, crop=True, all_touched=True)
                 out_meta = src.meta.copy()
 
             out_meta.update({

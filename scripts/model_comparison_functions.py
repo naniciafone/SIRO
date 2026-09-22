@@ -152,7 +152,7 @@ def get_raw_data(parent_dir, task_number):
         if raster:
             raw_data[date_str]['Snow Model'] = raster[0]
 
-        raster = glob.glob(os.path.join(dir_rasters, "*thickness*.tif"))
+        raster = glob.glob(os.path.join(dir_rasters, "*mores_creek*.tif"))
         if raster:
             raw_data[date_str]['iSnobal'] = raster[0]
 

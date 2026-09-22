@@ -11,7 +11,7 @@ import numpy as np
     # 2. Downsample data iteratively: 0.5 (native) -> 1.0 -> 10 -> 100 (m)
     # 3. Set all remaining negatives to 0
 
-#Establish directory with LiDAR files to be downsampled:
+# Establish directory with LiDAR files to be downsampled:
 
 dir = "C:/Users/RDCRLSMC/Desktop/SIRO/LiDAR"
 filtered = os.path.join(dir, "processed/filtered")
