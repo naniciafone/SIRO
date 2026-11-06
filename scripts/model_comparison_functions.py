@@ -5,6 +5,10 @@ import glob
 from osgeo import gdal
 from pyproj import Proj, Transformer
 
+# Output file tags written by Model_prep.py -> dataset names used in figures and tables
+MODEL_NAMES = {"HMS_EB": "HMS-EB", "HMS_TI": "HMS-TI", "iSnobal": "iSnobal", "SnowModel": "SnowModel"}
+LIDAR_NAMES = {"LiDAR": "LiDAR", "LiDAR_2000": "LiDAR-2000"}
+
 
 def x_y_snotel(snotel_station):
     """
@@ -128,6 +132,57 @@ def process_all_dates(parent_dir, task_number):
             modeled_data[date_str]['diff'] = models_diff
 
     return modeled_data
+
+
+def get_model_prep_outputs(parent_dir, task_number):
+    """
+    Collect the rasters written by Model_prep.py for one task, by exact filename.
+
+    Unlike process_all_dates(), this looks up each expected file by name rather than by
+    wildcard, so leftover files from older runs (e.g. HMS_Energy_Balance_lidar_resample.tif)
+    are never picked up. Missing files are reported and left out.
+
+    Args:
+        parent_dir (str): The parent directory containing subdirectories named 'YYYYMMDD'.
+        task_number (int): The task number (1 or 2).
+
+    Returns:
+        dict: {date: {"lidar": path, "lidar_2000": path, "meters": {name: path} (HMS only),
+                      "basin_clip": {name: path}, "lidar_clip": {name: path},
+                      "resample": {name: path}, "diff": {name: path}}}
+              where names are the values of MODEL_NAMES (and LIDAR_NAMES for "lidar_clip").
+    """
+    outputs = {}
+    for date_dir in sorted(find_date_directories(parent_dir)):
+        date_str = os.path.basename(date_dir)
+        rasters_dir = os.path.join(date_dir, "outputs", f"task{task_number}", "rasters")
+        expected = {
+            "lidar": os.path.join(rasters_dir, "LiDAR_MCS_clip.tif"),
+            "lidar_2000": os.path.join(rasters_dir, "LiDAR_2000_MCS_clip.tif"),
+            "meters": {name: os.path.join(rasters_dir, f"{tag}_meters.tif") for tag, name in MODEL_NAMES.items()
+                       if tag.startswith("HMS")},
+            "basin_clip": {name: os.path.join(rasters_dir, f"{tag}_basin_clip.tif") for tag, name in MODEL_NAMES.items()},
+            "lidar_clip": {name: os.path.join(rasters_dir, f"{tag}_MCS_clip.tif")
+                           for tag, name in {**LIDAR_NAMES, **MODEL_NAMES}.items()},
+            "resample": {name: os.path.join(rasters_dir, f"{tag}_lidar_resample.tif") for tag, name in MODEL_NAMES.items()},
+            "diff": {name: os.path.join(rasters_dir, f"{tag}_lidar_diff.tif") for tag, name in MODEL_NAMES.items()},
+        }
+
+        found, missing = {}, []
+        for key, value in expected.items():
+            if isinstance(value, dict):
+                found[key] = {name: path for name, path in value.items() if os.path.exists(path)}
+                missing += [path for path in value.values() if not os.path.exists(path)]
+            elif os.path.exists(value):
+                found[key] = value
+            else:
+                missing.append(value)
+        if missing:
+            print(f"{date_str} task {task_number}: {len(missing)} expected Model_prep.py outputs missing, "
+                  f"e.g. {os.path.basename(missing[0])}")
+        outputs[date_str] = found
+
+    return outputs
 
 
 def get_raw_data(parent_dir, task_number):
